@@ -8,6 +8,7 @@ import functools
 from types import ModuleType
 
 from ._common import (
+    PatchCompatibilityError,
     already_applied,
     load_exact_module,
     require_callable,
@@ -16,9 +17,14 @@ from ._common import (
 
 TARGET_MODULE = "vllm.models.kimi_k3.amd.linear"
 PATCH_ID = "worker.op_opt.kimi_k3.eplb_model_protocol"
-TARGETS = (f"{TARGET_MODULE}.KimiLinearForCausalLM.__init__",)
+TARGETS = (
+    f"{TARGET_MODULE}.KimiLinearForCausalLM.__init__",
+    f"{TARGET_MODULE}.KimiMoE.__init__",
+)
 _MARKER = "_vllm_hcu_kimi_k3_eplb_model_protocol_applied"
 _WRAPPER = "_vllm_hcu_kimi_k3_eplb_init_wrapper"
+_MOE_INIT_MARKER = "_vllm_hcu_kimi_k3_w4a8_native_width_applied"
+_MOE_INIT_WRAPPER = "_vllm_hcu_kimi_k3_w4a8_native_width_wrapper"
 
 
 def _init_moe_metadata(self) -> None:
@@ -87,12 +93,86 @@ def _update_physical_experts_metadata(
         layer.update_expert_map()
 
 
+def _wrap_kimi_moe_init(kimi_moe_cls) -> None:
+    """Keep aligned K3 W4A8 TP shards at their native width.
+
+    KimiMoE's upstream initializer may pad an expert partition up to its
+    legacy minimum. The HCU W4A8 MoE kernel only requires widths aligned to
+    32, so preserve the native TP partition when it already meets that
+    requirement. Lower the initializer's minimum only while constructing
+    that K3 W4A8 layer.
+    """
+    if getattr(kimi_moe_cls, _MOE_INIT_MARKER, False):
+        return
+    original_init = require_callable(
+        kimi_moe_cls,
+        "__init__",
+        f"{TARGET_MODULE}.KimiMoE.__init__",
+    )
+
+    @functools.wraps(original_init)
+    def hcu_kimi_moe_init(self, config, *args, **kwargs):
+        quant_config = kwargs.get("quant_config")
+        if quant_config is None and args:
+            quant_config = args[0]
+        get_name = getattr(quant_config, "get_name", None)
+        quant_name = get_name() if callable(get_name) else None
+        moe_size = getattr(config, "moe_intermediate_size", None)
+        if quant_name != "slimquant_w4a8" or moe_size is None:
+            return original_init(self, config, *args, **kwargs)
+
+        from vllm.distributed import get_tensor_model_parallel_world_size
+
+        tp_size = int(get_tensor_model_parallel_world_size())
+        moe_size = int(moe_size)
+        if tp_size < 1 or moe_size % tp_size:
+            return original_init(self, config, *args, **kwargs)
+        per_partition = moe_size // tp_size
+        if per_partition % 32:
+            return original_init(self, config, *args, **kwargs)
+
+        attr = "min_moe_intermediate_per_partition"
+        missing = object()
+        previous = getattr(config, attr, missing)
+        try:
+            setattr(config, attr, per_partition)
+        except (AttributeError, TypeError) as exc:
+            raise PatchCompatibilityError(
+                "Cannot preserve the native SlimQuant W4A8 Kimi-MoE width: "
+                f"{type(config).__name__}.{attr} is not writable"
+            ) from exc
+        try:
+            return original_init(self, config, *args, **kwargs)
+        finally:
+            if previous is missing:
+                delattr(config, attr)
+            else:
+                setattr(config, attr, previous)
+
+    setattr(hcu_kimi_moe_init, _MOE_INIT_WRAPPER, True)
+    setattr(kimi_moe_cls, "__init__", hcu_kimi_moe_init)
+    setattr(kimi_moe_cls, _MOE_INIT_MARKER, True)
+
+
 def apply_to_module(module: ModuleType) -> bool:
     target = load_exact_module(TARGET_MODULE, module)
     cls = require_class(
         target, "KimiLinearForCausalLM", f"{TARGET_MODULE}.KimiLinearForCausalLM"
     )
-    if already_applied(target, _MARKER, ((cls, "__init__", TARGETS[0], _WRAPPER),)):
+    kimi_moe_cls = require_class(target, "KimiMoE", f"{TARGET_MODULE}.KimiMoE")
+    if already_applied(
+        target,
+        _MARKER,
+        (
+            (cls, "__init__", TARGETS[0], _WRAPPER),
+            (
+                kimi_moe_cls,
+                "__init__",
+                f"{TARGET_MODULE}.KimiMoE.__init__",
+                _MOE_INIT_WRAPPER,
+            ),
+        ),
+    ):
         return False
     original_init = require_callable(cls, "__init__", TARGETS[0])
 
@@ -103,6 +183,7 @@ def apply_to_module(module: ModuleType) -> bool:
 
     setattr(hcu_init, _WRAPPER, True)
     setattr(cls, "__init__", hcu_init)
+    _wrap_kimi_moe_init(kimi_moe_cls)
     cls.set_eplb_state = _set_eplb_state
     cls.update_physical_experts_metadata = _update_physical_experts_metadata
     setattr(target, _MARKER, True)
