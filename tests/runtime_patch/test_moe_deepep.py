@@ -1797,8 +1797,10 @@ def test_moe_layer_forward_and_repacked_weight_contract(
     source = (
         "def FusedMoEFactory("
         + ", ".join(f"{name}=None" for name in factory_names)
-        + "):\n    return Runner(apply_router_weight_on_input, activation)\n"
+        + "):\n    factory_calls.append((enable_eplb, num_redundant_experts))\n"
+        + "    return Runner(apply_router_weight_on_input, activation)\n"
     )
+    layer_module.factory_calls = []
     exec(source, layer_module.__dict__)
     fused_moe_package = _module(
         "vllm.model_executor.layers.fused_moe",
@@ -1884,13 +1886,16 @@ def test_moe_layer_forward_and_repacked_weight_contract(
     monkeypatch.setattr(
         "vllm.config.get_current_vllm_config_or_none",
         lambda: SimpleNamespace(
-            model_config=SimpleNamespace(
-                hf_config=SimpleNamespace(model_type="kimi_k3")
-            )
+            model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="kimi_k3")),
+            parallel_config=SimpleNamespace(
+                enable_eplb=True,
+                eplb_config=SimpleNamespace(num_redundant_experts=16),
+            ),
         ),
     )
     kimi_runner = fused_moe_package.FusedMoE()
     assert kimi_runner.routed_experts.moe_config._hcu_kimi_k3 is True
+    assert layer_module.factory_calls[-1] == (True, 16)
     router_weight_runner = fused_moe_package.FusedMoE(
         apply_router_weight_on_input=True
     )

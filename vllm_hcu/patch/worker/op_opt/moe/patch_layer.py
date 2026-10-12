@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 import sys
 from types import ModuleType
 
@@ -216,18 +217,49 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(factory)
     def hcu_factory(*args, **kwargs):
-        runner = factory(*args, **kwargs)
-        _adapt_kimi_runner_forward_entry(runner)
-        experts = runner.routed_experts
         from vllm.config import get_current_vllm_config_or_none
 
         vllm_config = get_current_vllm_config_or_none()
         model_config = getattr(vllm_config, "model_config", None)
         hf_config = getattr(model_config, "hf_config", None)
+        is_kimi_k3 = getattr(hf_config, "model_type", None) == "kimi_k3"
+        parallel_config = getattr(vllm_config, "parallel_config", None)
+        if is_kimi_k3 and bool(getattr(parallel_config, "enable_eplb", False)):
+            eplb_config = getattr(parallel_config, "eplb_config", None)
+            if eplb_config is None:
+                raise PatchCompatibilityError(
+                    "Kimi-K3 EPLB is enabled without a vLLM EPLBConfig"
+                )
+            try:
+                bound = inspect.signature(factory).bind_partial(*args, **kwargs)
+            except TypeError as exc:
+                raise PatchCompatibilityError(
+                    "Cannot bind Kimi-K3 FusedMoEFactory EPLB arguments"
+                ) from exc
+            if "enable_eplb" not in bound.arguments:
+                bound.arguments["enable_eplb"] = True
+            elif not bound.arguments["enable_eplb"]:
+                raise PatchCompatibilityError(
+                    "Kimi-K3 FusedMoEFactory explicitly disabled EPLB while "
+                    "the vLLM parallel config enables it"
+                )
+            redundant = int(eplb_config.num_redundant_experts)
+            if "num_redundant_experts" in bound.arguments and int(
+                bound.arguments["num_redundant_experts"]
+            ) != redundant:
+                raise PatchCompatibilityError(
+                    "Kimi-K3 FusedMoEFactory redundant expert count disagrees "
+                    "with the vLLM EPLBConfig"
+                )
+            bound.arguments["num_redundant_experts"] = redundant
+            runner = factory(*bound.args, **bound.kwargs)
+        else:
+            runner = factory(*args, **kwargs)
+        _adapt_kimi_runner_forward_entry(runner)
+        experts = runner.routed_experts
         moe_config = getattr(experts, "moe_config", None)
         activation_value = getattr(moe_config, "activation", None)
         activation = getattr(activation_value, "value", activation_value)
-        is_kimi_k3 = getattr(hf_config, "model_type", None) == "kimi_k3"
         # FusedMoEFactory may run after the current VllmConfig context has
         # ended. v0.28.1 carries SiTU's explicit beta fields on FusedMoEConfig;
         # preserve the exact SiTU route identity there as a fail-closed signal

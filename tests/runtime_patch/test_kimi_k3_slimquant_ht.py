@@ -14,6 +14,12 @@ from vllm_hcu.model_executor.layers.quantization.slimquant_w4a8 import (
 from vllm_hcu.model_executor.layers.quantization import (
     compressed_tensors_moe_runtime as moe_runtime,
 )
+from vllm_hcu.model_executor.layers.quantization.slimquant_w4a8_deepgemm_runtime import (
+    _resolve_deepep_ll_prepare_finalize,
+)
+from vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ll import (
+    DeepEPLLPrepareAndFinalize,
+)
 
 
 def _method(*, backend: str, kimi: bool = True):
@@ -91,6 +97,59 @@ def test_non_kimi_ht_routes_keep_checkpoint_scales(backend, kimi, monkeypatch):
     assert not hasattr(layer, "_hcu_kimi_ht_w13_weight_scale")
     assert captured["w1_scale"] is layer.w13_weight_scale
     assert captured["w2_scale"] is layer.w2_weight_scale
+
+
+def test_kimi_ll_keeps_canonical_scales_for_masked_hipc(monkeypatch):
+    method = object.__new__(SlimQuantW4A8Int8AiterMoEMethod)
+    method.moe = SimpleNamespace(
+        _hcu_kimi_k3=True,
+        activation="situ",
+        moe_parallel_config=SimpleNamespace(
+            all2all_backend="deepep_low_latency", enable_eplb=True
+        ),
+    )
+    layer = _layer()
+    captured = {}
+
+    def capture_make(*args, **kwargs):
+        captured.update(kwargs)
+        return kwargs
+
+    monkeypatch.setattr(FusedMoEQuantConfig, "make", capture_make)
+    method.get_fused_moe_quant_config(layer)
+    assert captured["w1_scale"] is layer.w13_weight_scale
+    assert captured["w2_scale"] is layer.w2_weight_scale
+    assert method.supports_eplb
+
+
+@pytest.mark.parametrize("activation", ["situ", SimpleNamespace(value="situ")])
+def test_kimi_ll_eplb_support_is_limited_to_exact_route(activation):
+    method = object.__new__(SlimQuantW4A8Int8AiterMoEMethod)
+    method.moe = SimpleNamespace(
+        activation=activation,
+        moe_parallel_config=SimpleNamespace(
+            all2all_backend="deepep_low_latency", enable_eplb=False
+        ),
+    )
+    assert not method.supports_eplb
+    method.moe.moe_parallel_config.enable_eplb = True
+    assert method.supports_eplb
+    method.moe.activation = "silu"
+    assert not method.supports_eplb
+    method.moe.activation = "situ"
+    method.moe.moe_parallel_config.all2all_backend = "deepep_high_throughput"
+    assert not method.supports_eplb
+
+
+def test_kimi_ll_prepare_finalize_resolves_fixed_and_wrapped_contracts():
+    direct = object.__new__(DeepEPLLPrepareAndFinalize)
+    assert _resolve_deepep_ll_prepare_finalize(direct) is direct
+
+    wrapped_ll = object()
+    wrapped = SimpleNamespace(ll_prepare_finalize=wrapped_ll)
+    assert _resolve_deepep_ll_prepare_finalize(wrapped) is wrapped_ll
+
+    assert _resolve_deepep_ll_prepare_finalize(SimpleNamespace()) is None
 
 
 def test_kimi_ht_rejects_non_fp32_checkpoint_scales():

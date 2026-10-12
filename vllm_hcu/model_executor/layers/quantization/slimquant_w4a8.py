@@ -237,9 +237,9 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig:
-        # Keep the checkpoint scale as the canonical value except for the
-        # Kimi HT consumer, which requires its own derived x16 scale. The
-        # AITER and Triton routes keep their existing scale ownership.
+        # Keep checkpoint scales canonical. The HT specialization owns an
+        # x16 adapter parameter; masked LL HIPC applies that compensation in
+        # the kernel and must receive the canonical checkpoint scale.
         w13_scale = layer.w13_weight_scale
         w2_scale = layer.w2_weight_scale
         if self._is_kimi_ht():
@@ -265,6 +265,14 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             getattr(self.moe, "_hcu_kimi_k3", False)
             and getattr(moe_parallel_config, "all2all_backend", None)
             == "deepep_high_throughput"
+        )
+
+    def _is_kimi_ll(self) -> bool:
+        moe_parallel_config = getattr(self.moe, "moe_parallel_config", None)
+        return bool(
+            getattr(self.moe, "_hcu_kimi_k3", False)
+            and getattr(moe_parallel_config, "all2all_backend", None)
+            == "deepep_low_latency"
         )
 
     def _prepare_kimi_ht_scales(self, layer: torch.nn.Module) -> None:
@@ -329,6 +337,20 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
     @property
     def is_monolithic(self) -> bool:
         return False
+
+    @property
+    def supports_eplb(self) -> bool:
+        # Kimi fixed LL is safe for synchronous EPLB only because its masked
+        # N32 views alias the same in-place packed Parameter storage. Keep the
+        # capability limited to the exact model/backend/config combination.
+        parallel = getattr(self.moe, "moe_parallel_config", None)
+        activation = getattr(self.moe, "activation", None)
+        activation = getattr(activation, "value", activation)
+        return bool(
+            activation == "situ"
+            and getattr(parallel, "all2all_backend", None) == "deepep_low_latency"
+            and getattr(parallel, "enable_eplb", False)
+        )
 
     def create_weights(
         self,
@@ -413,7 +435,8 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
         ):
             return
         is_kimi_ht = self._is_kimi_ht()
-        if is_kimi_ht:
+        is_kimi_ll = self._is_kimi_ll()
+        if is_kimi_ht or is_kimi_ll:
             uses_deepep_auto = False
         else:
             from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
@@ -473,6 +496,40 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
             if not callable(process):
                 raise RuntimeError(
                     "Kimi-K3 DeepEP HT did not construct modular experts "
+                    "before weight postprocessing"
+                )
+            process(layer)
+            layer._hcu_slimquant_post_load_weight_generation = (
+                _slimquant_moe_tensor_generation(
+                    layer,
+                    _SLIMQUANT_MOE_WEIGHT_TENSORS,
+                )
+            )
+            layer._hcu_slimquant_post_load_generation = (
+                _slimquant_moe_tensor_generation(
+                    layer,
+                    _SLIMQUANT_MOE_LAYOUT_TENSORS,
+                )
+            )
+            return
+
+        if is_kimi_ll:
+            from vllm_hcu.model_executor.layers.quantization.slimquant_w4a8_deepgemm_runtime import (
+                make_kimi_k3_deepep_ll_w4a8_moe_kernel,
+            )
+
+            routing_tables = getattr(layer, "_expert_routing_tables", None)
+            self.moe_kernel = make_kimi_k3_deepep_ll_w4a8_moe_kernel(
+                moe_quant_config=self.moe_quant_config,
+                moe_config=self.moe,
+                routing_tables=routing_tables() if callable(routing_tables) else None,
+            )
+            fused_experts = getattr(self.moe_kernel, "fused_experts", None)
+            experts = getattr(fused_experts, "experts", fused_experts)
+            process = getattr(experts, "process_weights_after_loading", None)
+            if not callable(process):
+                raise RuntimeError(
+                    "Kimi-K3 DeepEP LL did not construct modular experts "
                     "before weight postprocessing"
                 )
             process(layer)

@@ -35,6 +35,7 @@ from vllm_hcu.model_executor.layers.fused_moe.experts.batched_deep_gemm_moe impo
 )
 
 logger = init_logger(__name__)
+_kimi_ll_logger = init_logger("vllm.hcu.kimi_k3_ll")
 
 
 @functools.lru_cache(maxsize=None)
@@ -72,6 +73,21 @@ def fuse_silu_mul_clamp_quant(*args, **kwargs):
     )
 
     return dpsk_v4_deep_gemm_moe.fuse_silu_mul_clamp_quant(*args, **kwargs)
+
+
+def _resolve_deepep_ll_prepare_finalize(prepare_finalize):
+    """Return the LL delegate for both fixed LL and HT/LL wrapper contracts."""
+    ll_prepare_finalize = getattr(prepare_finalize, "ll_prepare_finalize", None)
+    if ll_prepare_finalize is not None:
+        return ll_prepare_finalize
+
+    from vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ll import (
+        DeepEPLLPrepareAndFinalize,
+    )
+
+    if isinstance(prepare_finalize, DeepEPLLPrepareAndFinalize):
+        return prepare_finalize
+    return None
 
 
 def _canonical_weight_signature(layer: torch.nn.Module) -> tuple[object, ...]:
@@ -510,6 +526,134 @@ class DeepEPDeepGemmW4A8BatchedExperts(BatchedDeepGemmExperts):
         self._deepgemm_w2 = getattr(layer, cache_w2_name)
 
 
+class KimiK3LLExperts(DeepEPDeepGemmW4A8BatchedExperts):
+    """Kimi SiTU specialization for fixed DeepEP LL masked W4A8 GEMM."""
+
+    def __init__(
+        self,
+        moe_config: FusedMoEConfig,
+        quant_config: FusedMoEQuantConfig,
+        max_num_tokens: int,
+        num_dispatchers: int,
+    ) -> None:
+        super().__init__(moe_config, quant_config, max_num_tokens, num_dispatchers)
+        activation = getattr(moe_config.activation, "value", moe_config.activation)
+        if activation != "situ":
+            raise ValueError("Kimi-K3 DeepEP LL requires SiTU activation")
+        self._hcu_situ_beta = getattr(moe_config, "activation_situ_beta", None)
+        self._hcu_situ_linear_beta = getattr(
+            moe_config, "activation_situ_linear_beta", None
+        )
+        if self._hcu_situ_beta is None or self._hcu_situ_linear_beta is None:
+            raise ValueError("Kimi-K3 DeepEP LL requires SiTU beta parameters")
+        self._hcu_situ_beta = float(self._hcu_situ_beta)
+        self._hcu_situ_linear_beta = float(self._hcu_situ_linear_beta)
+        if not all(
+            torch.isfinite(torch.tensor(value)).item() and value > 0
+            for value in (self._hcu_situ_beta, self._hcu_situ_linear_beta)
+        ):
+            raise ValueError("Kimi-K3 SiTU beta values must be finite and positive")
+        self._hcu_situ_activation = True
+
+    @staticmethod
+    def _supports_activation(activation: MoEActivation) -> bool:
+        return activation == MoEActivation.SITU
+
+    @staticmethod
+    def adjust_N_for_activation(N: int, activation: MoEActivation) -> int:
+        if activation != MoEActivation.SITU:
+            raise ValueError("Kimi-K3 DeepEP LL requires SiTU activation")
+        return N // 2
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """Pack in place so EPLB's parameter views remain the weight owners."""
+        _validate_w4a8_channel_weights(layer)
+        # The MoE config can expose padded/TP partition sizes. The loaded
+        # channel scales describe the actual local HIPC matrix dimensions.
+        self._hcu_logical_n = int(layer.w13_weight_scale.size(1))
+        self._hcu_logical_k = int(layer.w2_weight_scale.size(1))
+        marker_name = "_hcu_kimi_ll_packed_ids"
+        marker = getattr(layer, marker_name, None)
+        parameters = (layer.w13_weight, layer.w2_weight)
+        _kimi_ll_logger.info_once(
+            "Kimi-K3 LL HIPC packing input shapes: w13=%s w2=%s",
+            tuple(layer.w13_weight.shape),
+            tuple(layer.w2_weight.shape),
+        )
+        if marker is not None:
+            if marker != tuple(id(parameter) for parameter in parameters):
+                raise RuntimeError(
+                    "Kimi-K3 LL weights changed after HIPC packing; reload is unsupported"
+                )
+        else:
+            with torch.no_grad():
+                packed = tuple(
+                    pack_w4a8_moe_hipc_weight(parameter.detach())
+                    for parameter in parameters
+                )
+            if any(
+                result.dtype != torch.int8
+                or result.ndim != 3
+                or tuple(result.shape) != tuple(parameter.shape)
+                or result.untyped_storage().data_ptr()
+                != parameter.untyped_storage().data_ptr()
+                for result, parameter in zip(packed, parameters)
+            ):
+                raise RuntimeError(
+                    "Kimi-K3 LL HIPC packing must preserve each rank-3 EPLB weight owner"
+                )
+            setattr(layer, marker_name, tuple(id(parameter) for parameter in parameters))
+
+        views = tuple(
+            view_w4a8_moe_hipc_weight_n32_layout(parameter.detach())
+            for parameter in parameters
+        )
+        if any(
+            view.untyped_storage().data_ptr()
+            != parameter.untyped_storage().data_ptr()
+            for view, parameter in zip(views, parameters)
+        ):
+            raise RuntimeError("Kimi-K3 LL N32 views must alias EPLB-owned weights")
+        self._deepgemm_w13, self._deepgemm_w2 = views
+
+
+def make_kimi_k3_deepep_ll_w4a8_moe_kernel(
+    moe_quant_config: FusedMoEQuantConfig,
+    moe_config: FusedMoEConfig,
+    routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+) -> mk.FusedMoEKernel:
+    """Build the fixed DeepEP LL kernel for Kimi-K3 SlimQuant W4A8."""
+    from vllm.model_executor.layers.fused_moe.all2all_utils import (
+        maybe_make_prepare_finalize,
+    )
+
+    if not moe_config.moe_parallel_config.use_deepep_ll_kernels:
+        raise RuntimeError("Kimi-K3 LL requires the fixed DeepEP LL backend")
+    prepare_finalize = maybe_make_prepare_finalize(
+        moe=moe_config,
+        quant_config=moe_quant_config,
+        routing_tables=routing_tables,
+        allow_new_interface=True,
+        use_monolithic=False,
+    )
+    if prepare_finalize is None:
+        raise RuntimeError("Kimi-K3 DeepEP LL prepare/finalize was not constructed")
+    ll_prepare_finalize = _resolve_deepep_ll_prepare_finalize(prepare_finalize)
+    if ll_prepare_finalize is None:
+        raise RuntimeError("Kimi-K3 DeepEP LL token-capacity interface is unavailable")
+    max_num_tokens = ll_prepare_finalize.max_num_tokens_per_rank()
+    if max_num_tokens is None:
+        raise RuntimeError("Kimi-K3 DeepEP LL token capacity is unavailable")
+    experts = KimiK3LLExperts(
+        moe_config=moe_config,
+        quant_config=moe_quant_config,
+        max_num_tokens=max_num_tokens,
+        num_dispatchers=prepare_finalize.num_dispatchers(),
+    )
+    _kimi_ll_logger.info_once("Using Kimi-K3 SiTU masked DeepEP LL W4A8 experts.")
+    return mk.FusedMoEKernel(prepare_finalize, experts)
+
+
 DeepEPDeepGemmW4A8MaskedExperts = DeepEPDeepGemmW4A8BatchedExperts
 
 
@@ -517,4 +661,6 @@ __all__ = [
     "DeepEPDeepGemmW4A8BatchedExperts",
     "DeepEPDeepGemmW4A8ContiguousExperts",
     "DeepEPDeepGemmW4A8MaskedExperts",
+    "KimiK3LLExperts",
+    "make_kimi_k3_deepep_ll_w4a8_moe_kernel",
 ]
