@@ -47,6 +47,21 @@ def _create_model_runner(
     use_v2_model_runner: bool,
 ):
     if not use_v2_model_runner:
+        # Kimi reference-trace validation needs the same metadata ordering and
+        # breakable graph execution as v0.25.1. The retained HCU MRV1 copy has
+        # stale imports on v0.28; use upstream's maintained MRV1 with the HCU
+        # worker/model/operator callbacks already installed above.
+        if (
+            getattr(vllm_config.model_config.hf_config, "model_type", None)
+            == "kimi_k3"
+            and vllm_config.parallel_config.data_parallel_size == 1
+            and vllm_config.parallel_config.prefill_context_parallel_size == 1
+        ):
+            from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+            runner = GPUModelRunner(vllm_config, device)
+            runner_logger.info("Kimi reference model runner constructed: %s", type(runner).__name__)
+            return runner
         raise RuntimeError(
             "vllm-plugin-das for vLLM main supports only Model Runner V2"
         )
