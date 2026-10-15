@@ -4,7 +4,7 @@
 """HCU integration boundary for vLLM's Model Runner V2."""
 
 import functools
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 import torch
 
@@ -43,6 +43,41 @@ def record_pp_spec_draft_index_stream(
         getattr(pp_handler, "broadcast_stream")
     )
     return True
+
+
+@contextmanager
+def suppress_sampler_warmup_logprobs(model_runner, input_batch):
+    """Skip synthetic logprob top-k work in the MRv2 sampler warmup.
+
+    The upstream V2 warmup requests five logprobs for each synthetic request.
+    On HCU, the resulting batched ``torch.topk`` may have no kernel image for
+    the warmup batch shape. Warmup only needs to exercise token sampling and
+    structured-output handling, so temporarily disable logprobs for those
+    synthetic slots. Real requests retain their requested logprob behavior.
+    """
+    req_ids = getattr(input_batch, "req_ids", ()) if input_batch is not None else ()
+    if not req_ids or not all(req_id.startswith("_warmup_") for req_id in req_ids):
+        yield
+        return
+
+    sampler = getattr(model_runner, "sampler", None)
+    sampling_states = getattr(sampler, "sampling_states", None)
+    if sampling_states is None:
+        yield
+        return
+
+    indices = [
+        int(index)
+        for index in input_batch.idx_mapping_np[: input_batch.num_reqs]
+        if int(index) >= 0
+    ]
+    num_logprobs = sampling_states.num_logprobs
+    saved = num_logprobs[indices].copy()
+    num_logprobs[indices] = -1
+    try:
+        yield
+    finally:
+        num_logprobs[indices] = saved
 
 
 class HcuGPUModelRunnerV2(GPUModelRunner):
@@ -201,41 +236,42 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         )
         pcp_manager = self.pcp_manager
         record_pp_spec_draft_index_stream(self, input_batch)
-        with scope:
-            if use_replicated_mtp_batch:
-                assert execute_model_state is not None
-                assert input_batch is not None
-                block_tables, slot_mappings = pcp_manager.prepare_global_attn()
-                slot_mappings_by_layer = build_slot_mappings_by_layer(
-                    slot_mappings, self.kv_cache_config
-                )
-                attn_metadata = self.model_state.prepare_attn(
-                    input_batch,
-                    CUDAGraphMode.NONE,
-                    block_tables,
-                    slot_mappings,
-                    self.attn_groups,
-                    self.kv_cache_config,
-                )
-                execute_model_state = execute_model_state._replace(
-                    attn_metadata=attn_metadata,
-                    slot_mappings_by_layer=slot_mappings_by_layer,
-                )
-                self.execute_model_state = execute_model_state
-            if use_replicated_mtp_batch:
-                # The HCU path restored PCP state above so it could rebuild
-                # global draft metadata. Upstream sample_tokens() now performs
-                # the same restore itself, so hide the manager to avoid a
-                # second gather/reorder of the global batch.
-                self.pcp_manager = None
-                try:
+        with suppress_sampler_warmup_logprobs(self, input_batch):
+            with scope:
+                if use_replicated_mtp_batch:
+                    assert execute_model_state is not None
+                    assert input_batch is not None
+                    block_tables, slot_mappings = pcp_manager.prepare_global_attn()
+                    slot_mappings_by_layer = build_slot_mappings_by_layer(
+                        slot_mappings, self.kv_cache_config
+                    )
+                    attn_metadata = self.model_state.prepare_attn(
+                        input_batch,
+                        CUDAGraphMode.NONE,
+                        block_tables,
+                        slot_mappings,
+                        self.attn_groups,
+                        self.kv_cache_config,
+                    )
+                    execute_model_state = execute_model_state._replace(
+                        attn_metadata=attn_metadata,
+                        slot_mappings_by_layer=slot_mappings_by_layer,
+                    )
+                    self.execute_model_state = execute_model_state
+                if use_replicated_mtp_batch:
+                    # The HCU path restored PCP state above so it could rebuild
+                    # global draft metadata. Upstream sample_tokens() now performs
+                    # the same restore itself, so hide the manager to avoid a
+                    # second gather/reorder of the global batch.
+                    self.pcp_manager = None
+                    try:
+                        output = super().sample_tokens(grammar_output)
+                    finally:
+                        self.pcp_manager = pcp_manager
+                else:
+                    # Upstream restores PCP only on the final PP stage. Non-final
+                    # ranks need the global batch restored before PP receive.
                     output = super().sample_tokens(grammar_output)
-                finally:
-                    self.pcp_manager = pcp_manager
-            else:
-                # Upstream restores PCP only on the final PP stage. Non-final
-                # ranks need the global batch restored before PP receive.
-                output = super().sample_tokens(grammar_output)
         return output
 
 
