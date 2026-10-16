@@ -20,6 +20,27 @@ def apply_to_module(module: ModuleType) -> bool:
     builder = require_class(
         target, "KimiK3ROCmKDAMetadataBuilder", TARGETS[0]
     )
+    original_build = builder.build
+
+    def build_metadata(self, common_prefix_len, common_attn_metadata, *args, **kwargs):
+        result = original_build(self, common_prefix_len, common_attn_metadata,
+                                *args, **kwargs)
+        from vllm_hcu.model_executor.layers.kimi_k3_prefill import (
+            LENGTHS_KEY, enabled,
+        )
+        if (enabled("VLLM_HCU_USE_KIMI_PREFILL_CPU_LENGTHS")
+                and result.num_prefills > 0
+                and result.spec_sequence_masks is None):
+            # Fresh list owned by this metadata object, not the scheduler's
+            # reusable pinned buffer. Decode-first order matches convolution.
+            boundaries = common_attn_metadata.query_start_loc_cpu
+            lengths = boundaries[:result.num_decodes + result.num_prefills + 1].diff().tolist()
+            if result.nums_dict is None:
+                result.nums_dict = {}
+            result.nums_dict[LENGTHS_KEY] = lengths
+        return result
+
+    builder.build = build_metadata
     original = builder._build_chunk_metadata
 
     def build(self, prefill_query_start_loc, prefill_query_start_loc_cpu, device):
