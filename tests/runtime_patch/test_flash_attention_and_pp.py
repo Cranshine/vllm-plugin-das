@@ -224,23 +224,58 @@ def test_hcu_fa_boundary_rejects_interface_without_layout(
 
 
 @pytest.mark.parametrize(
-    "incompatible_version",
+    "compatible_version",
     [
         "2.8.4",
-        "2.8.4+dtk2604.torch2110.2609200000.g111111",
-        "2.8.4+foo",
-        "2.8.4+dtk2605.torch2110.2609010000.g999999",
+        "2.8.4+dtk2604.torch2110.2610091222.g130fd4",
+        "2.8.4.post1+dtk2605.torch2110.2609010000.g999999",
+        "2.8.5+dtk2605.torch2110.2609010000.g999999",
+        "2.8.40",
     ],
 )
-def test_hcu_fa_boundary_rejects_vendor_build_without_known_gather_fix(
+def test_hcu_fa_boundary_accepts_compatible_2_8_release(
+    monkeypatch: pytest.MonkeyPatch,
+    compatible_version: str,
+) -> None:
+    _load_hcu_fa_utils_module(
+        monkeypatch,
+        kv_cache_layout="HND",
+        flash_attn_version=compatible_version,
+    )
+
+
+@pytest.mark.parametrize(
+    "incompatible_version",
+    [
+        "2.8.3+dtk2604.torch2110.2609241509.g624d7b",
+        "2.8.4rc1",
+        "2.8.4.dev1+dtk2604",
+        "2.8.4.post1.dev1",
+        "2.8.5rc1",
+        "2.8.5.dev1",
+        "2.9.0+dtk2604",
+    ],
+)
+def test_hcu_fa_boundary_rejects_incompatible_release(
     monkeypatch: pytest.MonkeyPatch,
     incompatible_version: str,
 ) -> None:
-    with pytest.raises(RuntimeError, match="native long-prefill gather fix"):
+    with pytest.raises(RuntimeError, match="compatible flash_attn release"):
         _load_hcu_fa_utils_module(
             monkeypatch,
             kv_cache_layout="HND",
             flash_attn_version=incompatible_version,
+        )
+
+
+def test_hcu_fa_boundary_rejects_invalid_distribution_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(RuntimeError, match="Invalid flash_attn distribution version"):
+        _load_hcu_fa_utils_module(
+            monkeypatch,
+            kv_cache_layout="HND",
+            flash_attn_version="vendor-build-without-pep440-version",
         )
 
 
@@ -701,6 +736,147 @@ def test_flash_cache_writer_dispatches_by_physical_layout(
     assert len(calls) == 1
     assert calls[0][0] == "hcu"
     assert calls[0][1][:5] == (key, value, key_cache, value_cache, slots)
+
+
+def test_flash_cache_writer_loads_hcu_extension_before_native_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fa_utils, _ = _load_hcu_fa_utils_module(
+        monkeypatch,
+        kv_cache_layout="NHD",
+    )
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+
+    calls: list[tuple[object, ...]] = []
+    loaded_modules: list[str] = []
+    hcu_namespace = SimpleNamespace()
+    monkeypatch.setattr(
+        fa_utils,
+        "torch",
+        SimpleNamespace(ops=SimpleNamespace(hcu_ops=hcu_namespace)),
+    )
+    real_import_module = importlib.import_module
+
+    def import_module_for_test(name: str, package: str | None = None):
+        if name == "vllm_hcu.hcu_ops":
+            loaded_modules.append(name)
+            hcu_namespace.reshape_and_cache_flash = (
+                lambda *args: calls.append(args)
+            )
+            return sys.modules[name]
+        return real_import_module(name, package)
+
+    monkeypatch.setattr(importlib, "import_module", import_module_for_test)
+
+    tensor = torch.zeros(1, 1, 8)
+    cache = torch.zeros(1, 1, 1, 8)
+    slots = torch.tensor([0])
+    scale = torch.tensor(1.0)
+    fa_utils.reshape_and_cache_flash(
+        tensor,
+        tensor,
+        cache,
+        cache,
+        slots,
+        "auto",
+        scale,
+        scale,
+    )
+
+    assert loaded_modules == ["vllm_hcu.hcu_ops"]
+    assert len(calls) == 1
+
+
+def test_flash_cache_writer_reports_missing_native_operator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fa_utils, _ = _load_hcu_fa_utils_module(
+        monkeypatch,
+        kv_cache_layout="NHD",
+    )
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setattr(
+        fa_utils,
+        "torch",
+        SimpleNamespace(
+            ops=SimpleNamespace(hcu_ops=SimpleNamespace()),
+        ),
+    )
+
+    tensor = torch.zeros(1, 1, 8)
+    cache = torch.zeros(1, 1, 1, 8)
+    slots = torch.tensor([0])
+    scale = torch.tensor(1.0)
+    with pytest.raises(
+        RuntimeError,
+        match=r"torch\.ops\.hcu_ops\.reshape_and_cache_flash.*rebuild or reinstall",
+    ):
+        fa_utils.reshape_and_cache_flash(
+            tensor,
+            tensor,
+            cache,
+            cache,
+            slots,
+            "auto",
+            scale,
+            scale,
+        )
+
+
+def test_flash_cache_writer_uses_triton_when_custom_ops_master_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fa_utils, _ = _load_hcu_fa_utils_module(
+        monkeypatch,
+        kv_cache_layout="HND",
+    )
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.delitem(sys.modules, "vllm_hcu.hcu_ops", raising=False)
+
+    calls: list[tuple[object, ...]] = []
+
+    def reject_native_writer(*args: object) -> None:
+        del args
+        pytest.fail("custom-op master-off path called the native HCU writer")
+
+    monkeypatch.setattr(
+        fa_utils,
+        "torch",
+        SimpleNamespace(
+            ops=SimpleNamespace(
+                hcu_ops=SimpleNamespace(
+                    reshape_and_cache_flash=reject_native_writer,
+                )
+            )
+        ),
+    )
+    triton_module_name = (
+        "vllm.v1.attention.ops.triton_reshape_and_cache_flash"
+    )
+    triton_module = ModuleType(triton_module_name)
+    triton_module.triton_reshape_and_cache_flash = (
+        lambda *args: calls.append(args)
+    )
+    monkeypatch.setitem(sys.modules, triton_module_name, triton_module)
+
+    tensor = torch.zeros(1, 1, 8)
+    cache = torch.zeros(1, 1, 1, 8)
+    slots = torch.tensor([0])
+    scale = torch.tensor(1.0)
+    fa_utils.reshape_and_cache_flash(
+        tensor,
+        tensor,
+        cache,
+        cache,
+        slots,
+        "bfloat16",
+        scale,
+        scale,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][5] == "auto"
+    assert "vllm_hcu.hcu_ops" not in sys.modules
 
 
 @pytest.mark.parametrize(

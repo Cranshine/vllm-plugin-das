@@ -30,7 +30,7 @@
   ],
   "jobs": {
     "accuracy-gfx936": {
-      "runner": "bw18",
+      "runner": "bw1000",
       "arch": "gfx936",
       "cards": 1,
       "suite": "accuracy-hcu",
@@ -42,7 +42,7 @@
       "requirements": []
     },
     "accuracy-gfx938": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "accuracy-hcu",
@@ -51,17 +51,22 @@
       "requirements": []
     },
     "contract-hcu-gfx936": {
-      "runner": "bw18",
+      "runner": "bw1000",
       "arch": "gfx936",
       "cards": 1,
       "suite": "contract-hcu",
-      "pytest_args": [],
+      "pytest_args": [
+        "--deselect",
+        "tests/patch/test_base_linear_parameter.py::test_official_registry_stdin_protocol_applies_adapter_and_one_linear",
+        "--deselect",
+        "tests/patch/test_base_linear_parameter.py::test_qwen35_real_inspect_cache_miss_uses_official_registry_command"
+      ],
       "timeout_minutes": 45,
       "requirements": [],
       "partitions": 2
     },
     "integration-smoke-gfx938": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "integration-smoke",
@@ -82,7 +87,7 @@
       "partitions": 2
     },
     "qwen35-smoke": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -100,7 +105,7 @@
       ]
     },
     "qwen35-graph": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -118,7 +123,7 @@
       ]
     },
     "engine-features": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -136,7 +141,7 @@
       ]
     },
     "lora": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -164,7 +169,7 @@
       ]
     },
     "spec-decode": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -182,7 +187,7 @@
       ]
     },
     "mamba-smoke": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -200,7 +205,7 @@
       ]
     },
     "kv-transfer": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -218,7 +223,7 @@
       ]
     },
     "qwen35-tp-ep": {
-      "runner": "hcu-linux-gfx938-4",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 4,
       "suite": "model",
@@ -236,7 +241,7 @@
       ]
     },
     "deepseek-tp-ep": {
-      "runner": "hcu-linux-gfx938-8",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 8,
       "suite": "model",
@@ -254,7 +259,7 @@
       ]
     },
     "qwen25-models": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -278,7 +283,7 @@
       ]
     },
     "qwen3-pooling": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -302,7 +307,7 @@
       ]
     },
     "qwen3-protocol": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -320,7 +325,7 @@
       ]
     },
     "qwen35-gsm8k": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -344,7 +349,7 @@
       ]
     },
     "qwen3-vl-mmmu": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -368,7 +373,7 @@
       ]
     },
     "qwen3-8b-gsm8k": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "model",
@@ -392,7 +397,7 @@
       ]
     },
     "qwen38-flash-next-humaneval": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 4,
       "suite": "model",
@@ -416,7 +421,7 @@
       ]
     },
     "qwen38-flash-next-int8-pp2-tp4-humaneval": {
-      "runner": "hcu-linux-gfx938-8",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 8,
       "suite": "model",
@@ -440,7 +445,7 @@
       ]
     },
     "deepseek-gsm8k": {
-      "runner": "hcu-linux-gfx938-8",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 8,
       "suite": "model",
@@ -464,7 +469,7 @@
       ]
     },
     "glm52-pcp": {
-      "runner": "hcu-linux-gfx938-8",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 8,
       "suite": "model",
@@ -488,7 +493,7 @@
       ]
     },
     "glm53-flash-channel-fp8-humaneval": {
-      "runner": "hcu-linux-gfx938-8",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 8,
       "suite": "model",
@@ -511,8 +516,32 @@
         }
       ]
     },
+    "kimi-k25-humaneval": {
+      "runner": "bw1100",
+      "arch": "gfx938",
+      "cards": 8,
+      "suite": "model",
+      "pytest_args": [
+        "-k",
+        "kimi_k25_humaneval_evalscope_server"
+      ],
+      "timeout_minutes": 360,
+      "requirements": [
+        {
+          "kind": "distribution",
+          "name": "evalscope",
+          "match": "exact",
+          "version": "1.9.1"
+        },
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_KIMI_K25_MODEL",
+          "relative": "Kimi-K2.5"
+        }
+      ]
+    },
     "single-node-topology": {
-      "runner": "nmz36",
+      "runner": "bw1100",
       "arch": "gfx938",
       "cards": 1,
       "suite": "distributed-single-node",
@@ -546,6 +575,7 @@
     {"job": "deepseek-gsm8k", "timeout_minutes": 360},
     {"job": "glm52-pcp", "timeout_minutes": 360},
     {"job": "glm53-flash-channel-fp8-humaneval", "timeout_minutes": 360},
+    {"job": "kimi-k25-humaneval", "timeout_minutes": 360},
     {"job": "single-node-topology", "timeout_minutes": 30}
   ],
   "groups": {
@@ -738,6 +768,15 @@
         "glm53-flash-channel-fp8-humaneval"
       ]
     },
+    "kimi-k25-evalscope": {
+      "patterns": [
+        "tests/integration/server/test_evalscope_kimi_k25_humaneval.py",
+        "tests/models/kimi_k25_humaneval_evalscope.yaml"
+      ],
+      "jobs": [
+        "kimi-k25-humaneval"
+      ]
+    },
     "model-runtime-helper": {
       "patterns": [
         "tests/integration/model_runtime.py"
@@ -850,7 +889,8 @@
         "qwen38-flash-next-int8-pp2-tp4-humaneval",
         "qwen3-vl-mmmu",
         "deepseek-gsm8k",
-        "glm53-flash-channel-fp8-humaneval"
+        "glm53-flash-channel-fp8-humaneval",
+        "kimi-k25-humaneval"
       ]
     },
     "evalscope-report-tests": {

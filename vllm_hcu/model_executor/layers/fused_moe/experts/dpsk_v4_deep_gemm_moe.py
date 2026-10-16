@@ -47,6 +47,7 @@ from vllm_hcu.model_executor.layers.quantization.slimquant_w4a8_deepgemm_runtime
     DeepEPDeepGemmW4A8ContiguousExperts,
     DeepEPDeepGemmW4A8MaskedExperts,
 )
+from vllm_hcu.platforms import envs as henvs
 
 # Use vLLM's configured logger hierarchy so worker-side backend evidence is
 # present in the normal engine log (``vllm_hcu.*`` has no configured handler).
@@ -185,7 +186,14 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
             None,
         )
         if packed_layout == self.WEIGHT_LAYOUT:
-            if layer.w13_weight.dim() == 6 and layer.w2_weight.dim() == 6:
+            try:
+                self._packed_deepgemm_problem_shape(
+                    layer.w13_weight,
+                    layer.w2_weight,
+                )
+            except RuntimeError:
+                pass
+            else:
                 self._deepgemm_w13 = layer.w13_weight
                 self._deepgemm_w2 = layer.w2_weight
                 return
@@ -474,7 +482,7 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
         w13: torch.Tensor,
         w2: torch.Tensor,
     ) -> tuple[int, int, int]:
-        if w13.dim() != 6 or w2.dim() != 6:
+        if w13.dim() != w2.dim() or w13.dim() not in (6, 7):
             raise RuntimeError(
                 "DeepEP DeepGEMM weights must be packed before apply(), "
                 f"got w13={tuple(w13.shape)} w2={tuple(w2.shape)}"
@@ -485,12 +493,19 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
                 f"w13={tuple(w13.shape)} w2={tuple(w2.shape)}"
             )
 
-        # The gfx938 Marlin FP8/INT8 packers map [E, N, K] to
-        # [E, K / 64, N / 16, 4, 16, 16].
         local_num_experts = w13.size(0)
-        n = w13.size(2) * w13.size(4)
-        k = w13.size(1) * w13.size(3) * w13.size(5)
-        w2_n = w2.size(2) * w2.size(4)
+        if w13.dim() == 7:
+            # gfx938 pair32 maps [E, N, K] to
+            # [E, K / 64, N / 32, 2, 4, 16, 16].
+            n = w13.size(2) * w13.size(3) * w13.size(5)
+            k = w13.size(1) * w13.size(4) * w13.size(6)
+            w2_n = w2.size(2) * w2.size(3) * w2.size(5)
+        else:
+            # gfx92a W6 maps [E, N, K] to
+            # [E, K / 64, N / 16, 4, 16, 16].
+            n = w13.size(2) * w13.size(4)
+            k = w13.size(1) * w13.size(3) * w13.size(5)
+            w2_n = w2.size(2) * w2.size(4)
         if w2_n != k:
             raise RuntimeError(
                 "DeepEP DeepGEMM packed down weight output size does not match "
@@ -613,7 +628,7 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
     ):
-        del topk_weights, global_num_experts, expert_map
+        del topk_weights, expert_map
         del a2_scale, apply_router_weight_on_input
         del workspace13
         if activation != MoEActivation.SILU:
@@ -641,6 +656,25 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
 
         local_num_experts, max_tokens, _ = hidden_states.shape
         _, _, N, K, _ = self.moe_problem_size(hidden_states, w1, w2, topk_ids)
+        expected_m = max_tokens
+        if not use_int8 and henvs.VLLM_HCU_USE_CUSTOM_OPS:
+            # DeepGEMM uses expected_m as a tile-selection hint; masked_m
+            # still controls the rows computed for each expert. Match the
+            # per-step estimate used by SGLang instead of the LL buffer's
+            # maximum capacity, which selects unnecessarily large tiles for
+            # small decode batches. Adding global_num_experts intentionally
+            # preserves SGLang's one-row margin at exact multiples and yields
+            # one row for an empty rank.
+            expected_m = min(
+                max_tokens,
+                (
+                    topk_ids.size(0)
+                    * self.num_dispatchers
+                    * topk_ids.size(1)
+                    + global_num_experts
+                )
+                // global_num_experts,
+            )
         expert_num_tokens = expert_tokens_meta.expert_num_tokens.to(
             dtype=torch.int32
         ).contiguous()
@@ -657,7 +691,7 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
             (self._deepgemm_w13, self._ensure_ll_weight_scale(self.w1_scale)),
             gateup_output,
             expert_num_tokens,
-            max_tokens,
+            expected_m,
         )
 
         if use_int8:
@@ -694,7 +728,7 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
             (self._deepgemm_w2, self._ensure_ll_weight_scale(self.w2_scale)),
             out_view,
             expert_num_tokens,
-            max_tokens,
+            expected_m,
         )
 
     @staticmethod
@@ -794,7 +828,10 @@ class DeepEPAutoDeepGemmExperts(mk.FusedMoEExpertsModular):
                 "_dsv4_channel_deepgemm_masked_w2",
                 None,
             )
-            if layer.w13_weight.dim() == 6 and layer.w2_weight.dim() == 6:
+            if (
+                layer.w13_weight.dim() in (6, 7)
+                and layer.w2_weight.dim() == layer.w13_weight.dim()
+            ):
                 if ll_w13 is None or ll_w2 is None:
                     raise RuntimeError(
                         "DeepEP auto DeepGEMM layer lost its masked weight layout"

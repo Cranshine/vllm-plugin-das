@@ -134,6 +134,10 @@ def test_worker_inventory_is_complete_explicit_and_dependency_ordered():
         "worker.op_opt.quantization.lightop_autoawq"
     ] == "always"
     framework_order = (
+        "worker.framework_opt.model_loader.static_eplb_preload",
+        "worker.framework_opt.model_loader.static_expert_mapping",
+        "worker.framework_opt.eplb.offline_expert_map",
+        "worker.framework_opt.eplb.gloo_profile_reservation",
         "worker.framework_opt.dp.deepep_low_latency",
         "worker.framework_opt.forward_context.hcu_runtime_fields",
         "worker.framework_opt.communicator.base_custom_sp",
@@ -188,6 +192,54 @@ def test_pcp_model_state_dispatcher_inventory_is_always_enabled():
         "vllm.v1.worker.gpu.model_states.default",
     ) in worker_dispatcher.worker_callback_names()
     assert worker_dispatcher._patch_features()[patch_id] == "always"
+
+
+def test_offline_eplb_and_eplb_control_features_are_independent():
+    offline_patch_ids = (
+        "worker.framework_opt.model_loader.static_eplb_preload",
+        "worker.framework_opt.model_loader.static_expert_mapping",
+        "worker.framework_opt.eplb.gloo_profile_reservation",
+    )
+    lifecycle_patch_id = "worker.framework_opt.eplb.offline_expert_map"
+    features = worker_dispatcher._patch_features()
+    assert all(
+        features[patch_id] == "offline_eplb"
+        for patch_id in offline_patch_ids
+    )
+    assert features[lifecycle_patch_id] == "eplb_control"
+
+    disabled = worker_dispatcher._feature_states(
+        None, worker_dispatcher.HcuFeatureConfig()
+    )
+    static = worker_dispatcher._feature_states(
+        None,
+        worker_dispatcher.HcuFeatureConfig(expert_map_path="/tmp/map.json"),
+    )
+    record = worker_dispatcher._feature_states(
+        None,
+        worker_dispatcher.HcuFeatureConfig(
+            expert_map_record_path="/tmp/record.json"
+        ),
+    )
+    standalone_disable = worker_dispatcher._feature_states(
+        None,
+        worker_dispatcher.HcuFeatureConfig(eplb_disable_rearrange=True),
+    )
+    assert disabled["offline_eplb"] is False
+    assert disabled["eplb_control"] is False
+    assert static["offline_eplb"] is True
+    assert static["eplb_control"] is True
+    assert record["offline_eplb"] is True
+    assert record["eplb_control"] is True
+    assert standalone_disable["offline_eplb"] is False
+    assert standalone_disable["eplb_control"] is True
+
+
+def test_gpu_dp_sync_is_not_in_worker_callback_inventory() -> None:
+    assert "worker.framework_opt.dp.gpu_deepep_low_latency" not in {
+        patch_id
+        for patch_id, _target in worker_dispatcher.worker_callback_names()
+    }
 
 
 def test_cold_replacement_metadata_matches_lazy_adapter_contracts():
@@ -266,7 +318,12 @@ def test_prepare_is_lazy_narrow_idempotent_and_keeps_main_role():
         "'vllm_hcu.model_executor.layers.fused_moe.aiter_ops'}; "
         "initial_targets=sorted(targets & sys.modules.keys()); "
         "assert initial_targets==["
-        "'vllm.distributed.device_communicators.base_device_communicator']; "
+        "'vllm.distributed.device_communicators.base_device_communicator',"
+        "'vllm.forward_context',"
+        "'vllm.utils.deep_gemm',"
+        "'vllm.v1.attention.backend',"
+        "'vllm.v1.worker.dp_utils',"
+        "'vllm.v1.worker.ubatch_utils']; "
         "assert not (business & sys.modules.keys()); "
         "first=prepare_worker_patches(); second=prepare_worker_patches(); "
         "print(json.dumps({'first':len(first),'second':len(second),"
@@ -291,16 +348,70 @@ def test_prepare_is_lazy_narrow_idempotent_and_keeps_main_role():
         "callbacks": expected_callbacks,
         "statuses": ["applied", "armed"],
         "initial_targets_loaded": [
-            "vllm.distributed.device_communicators.base_device_communicator"
+            "vllm.distributed.device_communicators.base_device_communicator",
+            "vllm.forward_context",
+            "vllm.utils.deep_gemm",
+            "vllm.v1.attention.backend",
+            "vllm.v1.worker.dp_utils",
+            "vllm.v1.worker.ubatch_utils",
         ],
         "targets_loaded": [
-            "vllm.distributed.device_communicators.base_device_communicator"
+            "vllm.distributed.device_communicators.base_device_communicator",
+            "vllm.forward_context",
+            "vllm.utils.deep_gemm",
+            "vllm.v1.attention.backend",
+            "vllm.v1.worker.dp_utils",
+            "vllm.v1.worker.ubatch_utils",
         ],
         "business_loaded": [],
         "runner_loaded": False,
         "shared_loaded": False,
         "builtins_same": True,
         "role": "Main",
+    }
+
+
+def test_custom_ops_zero_does_not_import_fused_ple_ops():
+    result = _run_fresh(
+        "import json,os,sys; "
+        "os.environ['VLLM_HCU_USE_CUSTOM_OPS']='0'; "
+        "from vllm_hcu.patch.platform import apply_platform_patches; "
+        "from vllm_hcu.patch.worker import prepare_worker_patches; "
+        "apply_platform_patches(); prepare_worker_patches(); "
+        "names={'ops':'vllm_hcu.models.qwen4_exp.common.ops.ple',"
+        "'replacement':'vllm_hcu.models.qwen4_exp.amd.ple_layer'}; "
+        "print(json.dumps({key:value in sys.modules for key,value in names.items()}))"
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout.strip().splitlines()[-1]) == {
+        "ops": False,
+        "replacement": False,
+    }
+
+
+def test_official_ple_fallback_remains_importable():
+    result = _run_fresh(
+        "import importlib,json,os,sys; "
+        "os.environ['VLLM_HCU_USE_CUSTOM_OPS']='0'; "
+        "from vllm_hcu.patch.platform import apply_platform_patches; "
+        "from vllm_hcu.patch.worker import prepare_worker_patches; "
+        "apply_platform_patches(); prepare_worker_patches(); "
+        "module=importlib.import_module('vllm.models.qwen4_exp.amd.ple_layer'); "
+        "model=importlib.import_module('vllm.models.qwen4_exp.amd.model'); "
+        "print(json.dumps({'name':module.__name__,"
+        "'official':not hasattr(module,'_vllm_hcu_qwen4_exp_ple_conv_applied'),"
+        "'model_fused':hasattr(model,'_vllm_hcu_qwen4_exp_fused_ple_applied'),"
+        "'ops_loaded':'vllm_hcu.models.qwen4_exp.common.ops.ple' in sys.modules,"
+        "'replacement_loaded':'vllm_hcu.models.qwen4_exp.amd.ple_layer' in sys.modules}))",
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout.strip().splitlines()[-1]) == {
+        "name": "vllm.models.qwen4_exp.amd.ple_layer",
+        "official": True,
+        "model_fused": False,
+        "ops_loaded": False,
+        "replacement_loaded": False,
     }
 
 

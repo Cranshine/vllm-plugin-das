@@ -124,7 +124,7 @@ def test_engram_config_allows_supported_hcu_and_preserves_wrapper_contract(
 
 
 @pytest.mark.parametrize("prefetch_enabled", ("0", "1"))
-def test_engram_config_rejects_hcu_cross_dp_embedding(
+def test_engram_config_allows_hcu_cross_dp_embedding(
     monkeypatch: pytest.MonkeyPatch,
     prefetch_enabled: str,
 ):
@@ -135,8 +135,7 @@ def test_engram_config_rejects_hcu_cross_dp_embedding(
 
     config = engram_config()
     config.embedding_across_dp = True
-    with pytest.raises(ValueError, match="does not support.*embedding_across_dp"):
-        config.verify_model_config(_model_config())
+    config.verify_model_config(_model_config())
 
 
 @pytest.mark.parametrize(
@@ -202,6 +201,7 @@ def test_envs_allows_only_hcu_namespace_and_defaults_aiter_off(
         environment_variables={
             "VLLM_KNOWN": lambda: "known",
             "VLLM_ROCM_USE_AITER_MOE": lambda: True,
+            "VLLM_USE_V2_MODEL_RUNNER": lambda: None,
         },
         validate_environ=original_validate,
         logger=logger,
@@ -234,7 +234,10 @@ def test_envs_allows_only_hcu_namespace_and_defaults_aiter_off(
 def test_envs_rejects_signature_drift_and_latches_failure():
     module = _module(
         patch_envs.TARGET_MODULE,
-        environment_variables={"VLLM_ROCM_USE_AITER_MOE": lambda: True},
+        environment_variables={
+            "VLLM_ROCM_USE_AITER_MOE": lambda: True,
+            "VLLM_USE_V2_MODEL_RUNNER": lambda: None,
+        },
         validate_environ=lambda: None,
         logger=logging.getLogger("test.hcu.bad_envs"),
     )
