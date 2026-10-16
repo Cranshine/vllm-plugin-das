@@ -974,7 +974,9 @@ def test_kimi_ll_masked_apply_uses_situ_activation_and_eplb_token_mask(
         _hcu_situ_beta=1.25,
         _hcu_situ_linear_beta=2.0,
         moe_problem_size=lambda *_args: (1, 2, 128, 64, 1),
-        estimate_expected_m=lambda **_kwargs: 16,
+        # A value above lightop's tuned window (<=19) must still flow
+        # through unchanged to SiTU and both GEMMs.
+        estimate_expected_m=lambda **_kwargs: 160,
     )
     output = torch.empty((1, 2, 64), dtype=torch.bfloat16)
     hcu["apply"](
@@ -1000,4 +1002,7 @@ def test_kimi_ll_masked_apply_uses_situ_activation_and_eplb_token_mask(
     assert activation_call["masked_m"] is mask
     assert activation_call["situ_beta"] == 1.25
     assert activation_call["situ_linear_beta"] == 2.0
-    assert activation_call["expect_m"] == 16
+    # SiTU and GEMM1/GEMM2 share one expected_m; no clamping or pinning.
+    assert activation_call["expect_m"] == 160
+    assert gemm_calls[0][4] == 160
+    assert gemm_calls[1][4] == 160

@@ -390,21 +390,30 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
         return (workspace13, workspace2, output)
 
     def estimate_expected_m(
-        self, global_num_experts: int, max_tokens_per_expert: int, topk: int
+        self,
+        global_num_experts: int,
+        max_tokens_per_expert: int,
+        topk: int,
+        local_num_tokens: int | None = None,
     ) -> int:
         dp_meta = (
             get_forward_context().dp_metadata
             if is_forward_context_available()
             else None
         )
-        if dp_meta is None:
+        if dp_meta is not None:
+            total_num_tokens = dp_meta.num_tokens_across_dp_cpu.sum().item()
+        elif local_num_tokens is not None and self.num_dispatchers is not None:
+            # DeepEP-LL skips dp_metadata by design. Every dispatcher pads to
+            # the same graph batch size, so local * num_dispatchers is a pure
+            # Python int and safe to bake into a cudagraph.
+            total_num_tokens = int(local_num_tokens) * int(self.num_dispatchers)
+        else:
             logger.warning_once(
                 "DPMetadata unavailable. Defaulting expected_m to "
                 f"{max_tokens_per_expert}.",
             )
             return max_tokens_per_expert
-
-        total_num_tokens = dp_meta.num_tokens_across_dp_cpu.sum().item()
         total_num_tokens_replicated = total_num_tokens * topk
 
         # Assume even load balancing
@@ -466,6 +475,7 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
             global_num_experts=global_num_experts,
             max_tokens_per_expert=max_num_tokens,
             topk=topk_ids.size(-1),
+            local_num_tokens=topk_ids.size(0),
         )
 
         if use_w4a8:
