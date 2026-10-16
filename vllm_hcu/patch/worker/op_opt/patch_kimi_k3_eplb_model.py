@@ -20,11 +20,70 @@ PATCH_ID = "worker.op_opt.kimi_k3.eplb_model_protocol"
 TARGETS = (
     f"{TARGET_MODULE}.KimiLinearForCausalLM.__init__",
     f"{TARGET_MODULE}.KimiMoE.__init__",
+    f"{TARGET_MODULE}.KimiLinearModel.load_weights",
 )
 _MARKER = "_vllm_hcu_kimi_k3_eplb_model_protocol_applied"
 _WRAPPER = "_vllm_hcu_kimi_k3_eplb_init_wrapper"
 _MOE_INIT_MARKER = "_vllm_hcu_kimi_k3_w4a8_native_width_applied"
 _MOE_INIT_WRAPPER = "_vllm_hcu_kimi_k3_w4a8_native_width_wrapper"
+_LOAD_WRAPPER = "_vllm_hcu_kimi_k3_redundant_expert_loader"
+
+
+def _wrap_model_load_weights(model_cls) -> None:
+    original_load = require_callable(model_cls, "load_weights", TARGETS[2])
+
+    @functools.wraps(original_load)
+    def load_weights(self, weights):
+        from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+        # Delegate redundant experts to their owning loader. The legacy Kimi
+        # inline loader neither requests redundant mappings nor visits multiple
+        # physical slots for one checkpoint expert (it breaks on first match).
+        # RoutedExperts already handles both, including static-plan fanout and
+        # the rank-local physical ID conversion in each parameter's loader.
+        owners = {
+            name.removesuffix(".routed_experts"): (name, owner)
+            for name, owner in self.named_modules()
+            if isinstance(owner, RoutedExperts)
+            and owner.moe_config.num_experts > owner.moe_config.num_logical_experts
+        }
+        if not owners:
+            return original_load(self, weights)
+        loaded = set()
+
+        def remaining_weights():
+            for entry in weights:
+                name, weight = entry[:2]
+                parent, separator, expert_name = name.partition(".experts.")
+                destination = owners.get(parent + ".experts") if separator else None
+                if destination is None:
+                    yield entry
+                    continue
+                module_name, owner = destination
+                # Kimi's inline loader calls these w1/w2/w3 even when the
+                # factory leaves the owner's conventional checkpoint names.
+                parts = expert_name.split(".", 2)
+                if len(parts) == 3 and parts[0].isdigit():
+                    projections = {
+                        "w1": owner.ckpt_gate_proj_name,
+                        "w2": owner.ckpt_down_proj_name,
+                        "w3": owner.ckpt_up_proj_name,
+                    }
+                    projection = projections.get(parts[1], parts[1])
+                    expert_name = f"{parts[0]}.{projection}.{parts[2]}"
+                if (
+                    expert_name.endswith(".weight_packed")
+                    and not hasattr(owner, "w13_weight_packed")
+                ):
+                    expert_name = expert_name.removesuffix("_packed")
+                for param_name in owner.load_weights(((expert_name, weight),)):
+                    loaded.add(f"{module_name}.{param_name}")
+
+        result = original_load(self, remaining_weights())
+        return result | loaded
+
+    setattr(load_weights, _LOAD_WRAPPER, True)
+    model_cls.load_weights = load_weights
 
 
 def _init_moe_metadata(self) -> None:
@@ -160,6 +219,9 @@ def apply_to_module(module: ModuleType) -> bool:
         target, "KimiLinearForCausalLM", f"{TARGET_MODULE}.KimiLinearForCausalLM"
     )
     kimi_moe_cls = require_class(target, "KimiMoE", f"{TARGET_MODULE}.KimiMoE")
+    model_cls = require_class(
+        target, "KimiLinearModel", f"{TARGET_MODULE}.KimiLinearModel"
+    )
     if already_applied(
         target,
         _MARKER,
@@ -171,6 +233,7 @@ def apply_to_module(module: ModuleType) -> bool:
                 f"{TARGET_MODULE}.KimiMoE.__init__",
                 _MOE_INIT_WRAPPER,
             ),
+            (model_cls, "load_weights", TARGETS[2], _LOAD_WRAPPER),
         ),
     ):
         return False
@@ -184,6 +247,7 @@ def apply_to_module(module: ModuleType) -> bool:
     setattr(hcu_init, _WRAPPER, True)
     setattr(cls, "__init__", hcu_init)
     _wrap_kimi_moe_init(kimi_moe_cls)
+    _wrap_model_load_weights(model_cls)
     cls.set_eplb_state = _set_eplb_state
     cls.update_physical_experts_metadata = _update_physical_experts_metadata
     setattr(target, _MARKER, True)
