@@ -1986,6 +1986,23 @@ def test_moe_layer_forward_and_repacked_weight_contract(
     kimi_runner = fused_moe_package.FusedMoE()
     assert kimi_runner.routed_experts.moe_config._hcu_kimi_k3 is True
     assert layer_module.factory_calls[-1] == (True, 16)
+    # KimiK3ForConditionalGeneration initializes its language model with the
+    # real inner text config, not the outer multimodal config.
+    from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
+
+    monkeypatch.setattr(
+        "vllm.config.get_current_vllm_config_or_none",
+        lambda: SimpleNamespace(
+            model_config=SimpleNamespace(hf_config=KimiLinearConfig()),
+            parallel_config=SimpleNamespace(
+                enable_eplb=True,
+                eplb_config=SimpleNamespace(num_redundant_experts=16),
+            ),
+        ),
+    )
+    nested_kimi_runner = fused_moe_package.FusedMoE()
+    assert nested_kimi_runner.routed_experts.moe_config._hcu_kimi_k3 is True
+    assert layer_module.factory_calls[-1] == (True, 16)
     router_weight_runner = fused_moe_package.FusedMoE(
         apply_router_weight_on_input=True
     )

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Merge Kimi's replicated Q/KV-A and sharded output gate without vLLM edits."""
+from contextvars import ContextVar
 from functools import wraps
 from inspect import signature
 from types import ModuleType
@@ -8,8 +9,10 @@ from ._common import load_exact_module
 TARGET_MODULE = "vllm.models.kimi_k3.amd.linear"
 PATCH_ID = "worker.op_opt.kimi_k3.mla_gate"
 TARGETS = (f"{TARGET_MODULE}.KimiMLAAttention.__init__",
+           f"{TARGET_MODULE}.KimiLinearModel.__init__",
            f"{TARGET_MODULE}.KimiLinearModel.load_weights")
 _MARKER = "_hcu_kimi_merged_mla_gate"
+_LOADER_SCOPE = ContextVar("kimi_mla_gate_loader_scope", default=False)
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -23,12 +26,24 @@ def apply_to_module(module: ModuleType) -> bool:
     original_init = target.KimiMLAAttention.__init__
     init_signature = signature(original_init)
     original_load = target.KimiLinearModel.load_weights
+    original_model_init = target.KimiLinearModel.__init__
+
+    @wraps(original_model_init)
+    def model_init(self, *args, **kwargs):
+        # Only this owner has the gate-shard loader below. MTP and DSpark
+        # construct attention independently and must keep their native layout.
+        token = _LOADER_SCOPE.set(True)
+        try:
+            original_model_init(self, *args, **kwargs)
+        finally:
+            _LOADER_SCOPE.reset(token)
 
     @wraps(original_init)
     def init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
         from vllm_hcu.platforms import envs as henvs
-        if not (enabled() and henvs.optional_custom_op_enabled(True)
+        if not (_LOADER_SCOPE.get() and enabled()
+                and henvs.optional_custom_op_enabled(True)
                 and self.use_output_gate and self.q_lora_rank is not None
                 and not getattr(self.mla_attn, "dcp_q_replicate", False)):
             return
@@ -83,6 +98,7 @@ def apply_to_module(module: ModuleType) -> bool:
         return result | loaded
 
     target.KimiMLAAttention.__init__ = init
+    target.KimiLinearModel.__init__ = model_init
     target.KimiLinearModel.load_weights = load
     setattr(target, _MARKER, True)
     return True

@@ -6,6 +6,7 @@ import os
 import gc
 import torch
 import math
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Type, Union
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
 from vllm.utils.torch_utils import set_random_seed
@@ -148,6 +149,16 @@ class HcuGPUWorker(Worker):
             refresh_glm53_router_gates(self.model_runner.model)
 
     def compile_or_warm_up_model(self):
+        if self.use_v2_model_runner:
+            from vllm_hcu.v1.hcu_model_runner_v2 import sampler_warmup_scope
+
+            scope = sampler_warmup_scope()
+        else:
+            scope = nullcontext()
+        with scope:
+            return self._compile_or_warm_up_model()
+
+    def _compile_or_warm_up_model(self):
         if (
             self.use_v2_model_runner
             and self.parallel_config.pipeline_parallel_size > 1

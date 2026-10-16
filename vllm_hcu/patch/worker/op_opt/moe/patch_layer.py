@@ -222,7 +222,11 @@ def apply_to_module(module: ModuleType) -> bool:
         vllm_config = get_current_vllm_config_or_none()
         model_config = getattr(vllm_config, "model_config", None)
         hf_config = getattr(model_config, "hf_config", None)
-        is_kimi_k3 = getattr(hf_config, "model_type", None) == "kimi_k3"
+        # init_vllm_registered_model installs the inner text config while
+        # constructing Kimi-K3's language model (model_type="kimi_linear").
+        is_kimi_k3 = getattr(hf_config, "model_type", None) in (
+            "kimi_k3", "kimi_linear"
+        )
         parallel_config = getattr(vllm_config, "parallel_config", None)
         if is_kimi_k3 and bool(getattr(parallel_config, "enable_eplb", False)):
             eplb_config = getattr(parallel_config, "eplb_config", None)

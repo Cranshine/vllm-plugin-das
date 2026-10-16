@@ -47,7 +47,7 @@ def _layer(dtype: torch.dtype = torch.float32) -> nn.Module:
     return layer
 
 
-def test_kimi_ht_uses_stable_derived_scale_parameters(monkeypatch):
+def test_kimi_ht_passes_canonical_scale_parameters_without_compensation(monkeypatch):
     method = _method(backend="deepep_high_throughput")
     layer = _layer()
     captured = {}
@@ -58,22 +58,16 @@ def test_kimi_ht_uses_stable_derived_scale_parameters(monkeypatch):
 
     monkeypatch.setattr(FusedMoEQuantConfig, "make", capture_make)
     method._prepare_kimi_ht_scales(layer)
-    w13_derived = layer._hcu_kimi_ht_w13_weight_scale
-    w2_derived = layer._hcu_kimi_ht_w2_weight_scale
-
-    assert isinstance(w13_derived, nn.Parameter)
-    assert isinstance(w2_derived, nn.Parameter)
-    assert not w13_derived.requires_grad and not w2_derived.requires_grad
-    torch.testing.assert_close(w13_derived, layer.w13_weight_scale * 16.0)
-    torch.testing.assert_close(w2_derived, layer.w2_weight_scale * 16.0)
-
     method.get_fused_moe_quant_config(layer)
-    assert captured["w1_scale"] is w13_derived
-    assert captured["w2_scale"] is w2_derived
+    assert captured["w1_scale"] is layer.w13_weight_scale
+    assert captured["w2_scale"] is layer.w2_weight_scale
+    assert not hasattr(layer, "_hcu_kimi_ht_w13_weight_scale")
+    assert not hasattr(layer, "_hcu_kimi_ht_w2_weight_scale")
 
     method._prepare_kimi_ht_scales(layer)
-    assert layer._hcu_kimi_ht_w13_weight_scale is w13_derived
-    assert layer._hcu_kimi_ht_w2_weight_scale is w2_derived
+    method.get_fused_moe_quant_config(layer)
+    assert captured["w1_scale"] is layer.w13_weight_scale
+    assert captured["w2_scale"] is layer.w2_weight_scale
     torch.testing.assert_close(layer.w13_weight_scale, torch.tensor([[0.25, 0.5]]))
 
 

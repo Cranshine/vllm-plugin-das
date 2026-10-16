@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+from vllm_hcu.platforms import envs as henvs
 
 
 class SituAndMul(nn.Module):
@@ -17,7 +18,8 @@ class SituAndMul(nn.Module):
         self.linear_beta = None if linear_beta is None else float(linear_beta)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.is_cuda and x.is_contiguous() and x.numel() > 0:
+        if (henvs.custom_ops_enabled()
+                and x.is_cuda and x.is_contiguous() and x.numel() > 0):
             from boltops.fused_moe.triton.moe_activation import (
                 triton_situ_and_mul,
             )

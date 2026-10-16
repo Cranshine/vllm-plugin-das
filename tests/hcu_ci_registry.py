@@ -73,6 +73,11 @@ register_hcu_ci(
     target="tests/accuracy/test_unified_aiter_moe_operator.py",
     est_time=330,
 )
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/runtime_patch/test_gate_linear_context.py",
+    est_time=180,
+)
 
 register_hcu_ci(
     job="contract-hcu-gfx936",
@@ -147,6 +152,26 @@ register_hcu_ci(
 register_hcu_ci(
     job="contract-hcu-gfx936",
     target="tests/runtime_patch/test_sparse_indexer_loading.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_kimi_k3_reference_adapters.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_kimi_k3_slimquant_ht.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_kimi_k3_eplb_model.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/runtime_patch/test_hcu_model_runner_v2_api.py",
     est_time=60,
 )
 

@@ -237,14 +237,10 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig:
-        # Keep checkpoint scales canonical. The HT specialization owns an
-        # x16 adapter parameter; masked LL HIPC applies that compensation in
-        # the kernel and must receive the canonical checkpoint scale.
+        # Both contiguous HT and masked LL HIPC apply the packed INT4 x16
+        # compensation internally. Pass checkpoint scales unchanged.
         w13_scale = layer.w13_weight_scale
         w2_scale = layer.w2_weight_scale
-        if self._is_kimi_ht():
-            w13_scale = getattr(layer, "_hcu_kimi_ht_w13_weight_scale", w13_scale)
-            w2_scale = getattr(layer, "_hcu_kimi_ht_w2_weight_scale", w2_scale)
         self.moe_quant_config = FusedMoEQuantConfig.make(
             torch.int8,
             w1_scale=w13_scale,
@@ -285,18 +281,9 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
         if any(value.dtype != torch.float32 for value in sources):
             raise TypeError("Kimi DeepEP HT checkpoint scales must be FP32")
 
-        derived_names = (
-            "_hcu_kimi_ht_w13_weight_scale",
-            "_hcu_kimi_ht_w2_weight_scale",
-        )
         marker = getattr(layer, "_hcu_kimi_ht_scale_ids", None)
+        current = tuple(id(source) for source in sources)
         if marker is not None:
-            current = (
-                id(sources[0]),
-                id(sources[1]),
-                id(getattr(layer, derived_names[0], None)),
-                id(getattr(layer, derived_names[1], None)),
-            )
             if marker != current:
                 raise RuntimeError(
                     "Kimi DeepEP HT scale Parameters changed after binding; "
@@ -304,15 +291,7 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
                 )
             return
 
-        derived = tuple(
-            Parameter(source.detach() * 16.0, requires_grad=False)
-            for source in sources
-        )
-        for name, parameter in zip(derived_names, derived):
-            layer.register_parameter(name, parameter)
-        layer._hcu_kimi_ht_scale_ids = (
-            id(sources[0]), id(sources[1]), id(derived[0]), id(derived[1])
-        )
+        layer._hcu_kimi_ht_scale_ids = current
 
     @staticmethod
     def _get_deepgemm_moe_quant_config(

@@ -32,6 +32,7 @@ from tests.accuracy.deepseek_v4_dspark_ops_cases import (
     test_masked_channel_int8_deepgemm_matches_dequantized_reference,
 )
 from tests.accuracy.kimi_k3_ll_ops_cases import (
+    test_kimi_ht_canonical_scales_match_live_hipc_gemms,
     test_kimi_ll_situ_masked_w4a8_matches_dequantized_reference,
 )
 

@@ -26,7 +26,8 @@ def test_kimi_model_exposes_moe_protocol_and_current_weight_views(monkeypatch):
             self.updated += 1
 
     class KimiMoE:
-        pass
+        def __init__(self, config):
+            self.config = config
 
     class Model:
         def __init__(self):
@@ -34,7 +35,7 @@ def test_kimi_model_exposes_moe_protocol_and_current_weight_views(monkeypatch):
             self.end_layer = 2
             self.layers = [
                 SimpleNamespace(mlp=SimpleNamespace(experts=Runner())),
-                SimpleNamespace(mlp=KimiMoE()),
+                SimpleNamespace(mlp=KimiMoE(SimpleNamespace())),
             ]
             self.layers[1].mlp.experts = Runner()
 

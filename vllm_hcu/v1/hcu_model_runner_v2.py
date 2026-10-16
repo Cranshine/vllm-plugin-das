@@ -6,6 +6,7 @@
 import functools
 import os
 from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 
 import numpy as np
 import torch
@@ -37,6 +38,17 @@ _USE_HOST_SEQ_LENS = henvs.optional_custom_op_enabled(
 )
 # Debug: compare the mirror against the device seq_lens every step.
 _CHECK_HOST_SEQ_LENS = os.environ.get("VLLM_HCU_CHECK_HOST_SEQ_LENS", "0") == "1"
+_SAMPLER_WARMUP = ContextVar("hcu_sampler_warmup", default=False)
+
+
+@contextmanager
+def sampler_warmup_scope():
+    """Mark worker-controlled startup, independently of user request IDs."""
+    token = _SAMPLER_WARMUP.set(True)
+    try:
+        yield
+    finally:
+        _SAMPLER_WARMUP.reset(token)
 
 
 def record_pp_spec_draft_index_stream(
@@ -71,8 +83,7 @@ def suppress_sampler_warmup_logprobs(model_runner, input_batch):
     structured-output handling, so temporarily disable logprobs for those
     synthetic slots. Real requests retain their requested logprob behavior.
     """
-    req_ids = getattr(input_batch, "req_ids", ()) if input_batch is not None else ()
-    if not req_ids or not all(req_id.startswith("_warmup_") for req_id in req_ids):
+    if not _SAMPLER_WARMUP.get() or input_batch is None:
         yield
         return
 

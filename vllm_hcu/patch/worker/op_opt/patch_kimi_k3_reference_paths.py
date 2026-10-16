@@ -4,6 +4,7 @@ from __future__ import annotations
 from types import ModuleType
 import functools
 import torch
+from vllm_hcu.platforms import envs as henvs
 from ._common import load_exact_module, require_class
 
 TARGET_MODULE = "vllm.models.kimi_k3.amd.linear"
@@ -147,8 +148,17 @@ def apply_to_module(module: ModuleType) -> bool:
     # sequence. The HCU runner fuses latent+shared partials before RMSNorm.
     target.ROCmLatentMoERunner = MoERunner
     transform._hcu_fuse_shared_and_routed_tp_all_reduce = True
-    target._apply_attn_res = _apply_attn_res
-    decoder.forward_attn_residual = forward_attn_residual
+    original_residual_forward = decoder.forward_attn_residual
+
+    @functools.wraps(original_residual_forward)
+    def hcu_residual_forward(self, *args, **kwargs):
+        if not henvs.custom_ops_enabled():
+            return original_residual_forward(self, *args, **kwargs)
+        return forward_attn_residual(self, *args, **kwargs)
+
+    # The upstream helper accepts fused norm/delta arguments that the BoltOps
+    # helper does not. Restore the complete upstream forward when disabled.
+    decoder.forward_attn_residual = hcu_residual_forward
     moe = require_class(target, "KimiMoE", f"{TARGET_MODULE}.KimiMoE")
     original_init = moe.__init__
 

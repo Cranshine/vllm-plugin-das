@@ -32,7 +32,7 @@ class HcuKimiK3MergedMLAWrapper(KimiK3MultiHeadLatentAttentionWrapper):
             assert self.q_proj is not None
             kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
             q = self.q_proj(hidden_states)[0]
-    
+
         kv_c, k_pe = kv_lora.split(
             [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
@@ -47,7 +47,7 @@ class HcuKimiK3MergedMLAWrapper(KimiK3MultiHeadLatentAttentionWrapper):
             self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
         if llama_4_scaling is not None:
             q *= llama_4_scaling
-    
+
         attn_out = self.mla_attn(
             q,
             kv_c_normed,
