@@ -77,11 +77,14 @@ if TYPE_CHECKING:
     VLLM_HCU_DEEPEP_NUM_SMS: Optional[int] = None
     VLLM_HCU_DPSK_V4_DEEPEP_LL_USE_HCU_DISPATCH_API: bool = False
     VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE: bool = False
+    VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_QUERIES: bool = True
     VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH: bool = False
     VLLM_HCU_ENABLE_REQUEST_CUDAGRAPH_BUCKETS: bool = False
     VLLM_HCU_PLE_CPU_OFFLOAD: bool = False
     VLLM_HCU_PLE_PREFETCH_STREAM: bool = False
     VLLM_HCU_QWEN4_EXP_HC_SP: bool = True
+    VLLM_HCU_MHC_FUSED_RMSNORM: bool = True
+    VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS: bool = True
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     """
@@ -594,6 +597,11 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
         lambda: (os.environ.get("VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE", "False").lower() in
                     ("true", "1")),
 
+    # DeepSeek V4 PCP: keep attention queries rank-local and gather only KV.
+    "VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_QUERIES":
+        lambda: os.getenv("VLLM_HCU_DEEPSEEK_V4_PCP_LOCAL_QUERIES", "True").lower()
+        in ("1", "true"),
+
     # Launch shared_experts on the auxiliary stream before routed MoE/DeepEP,
     # and wait only when the shared output is consumed.
     "VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH":
@@ -630,6 +638,29 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # (token-major pages, LightOp decode reader).
     "VLLM_HCU_INDEXER_KCACHE_LAYOUT":
         indexer_kcache_layout,
+
+    # Route the RMSNorm applied after the mHC pre/fused-post-pre kernels
+    # through aten's single fused rms_norm kernel instead of
+    # vllm.ir.ops.rms_norm's native implementation (8 elementwise/reduce
+    # kernels when no fused IR provider is registered, the case on HCU).
+    # Affects every model on the native mHC fallback path (GLM5Next,
+    # DeepSeek V4, ...); consulted once at patch-apply time. See
+    # patch_mhc_fused_rmsnorm.py. Enabled by default; set to 0 to disable.
+    "VLLM_HCU_MHC_FUSED_RMSNORM":
+        lambda: (os.environ.get("VLLM_HCU_MHC_FUSED_RMSNORM", "True").lower() in
+                    ("true", "1")),
+
+    # Skip the .contiguous() copies GLM5Next's fused_recurrent_kda otherwise
+    # applies to q/k/v/g/beta before the recurrent decode/spec-verify kernel,
+    # by passing per-token strides into the kernel instead. On the decode and
+    # spec-verify paths q/k/v are non-contiguous views split out of the merged
+    # qkv causal-conv1d output, so this removes 4-5 elementwise copy kernels
+    # per step. Consulted once at patch-apply time. See
+    # patch_glm5next_kda_strided_recurrent.py. Enabled by default; set to 0
+    # to disable.
+    "VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS":
+        lambda: (os.environ.get("VLLM_HCU_GLM5NEXT_KDA_STRIDED_INPUTS", "True").lower() in
+                    ("true", "1")),
 }
 
 # end-env-vars-definition
