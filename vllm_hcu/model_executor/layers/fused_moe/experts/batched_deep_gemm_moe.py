@@ -507,7 +507,7 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
                     masked_m=expert_num_tokens,
                     situ_beta=self._hcu_situ_beta,
                     situ_linear_beta=self._hcu_situ_linear_beta,
-                    expect_m=expected_m,
+                    expect_m=16,
                 )
             elif clamp_limit is not None and clamp_limit > 0:
                 clamp_quant = (
