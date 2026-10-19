@@ -286,14 +286,38 @@ def test_dspark_draft_role_sep_moves_ag_out_of_graph(monkeypatch):
     assert markov_inputs == [(3, (3, 2, 64))]
 
 
-def test_dspark_draft_role_sep_rejects_new_api_and_bad_manager(monkeypatch):
+def test_dspark_role_sep_wraps_owned_cudagraph_manager(monkeypatch):
     monkeypatch.setattr(
         "vllm.distributed.get_tensor_model_parallel_world_size", lambda: 2
     )
     dflash_cls, dspark_cls = _make_speculator_cls()
-    # The DSpark class already owns init_cudagraph_manager: the audited
-    # delegation expects the DFlashSpeculator implementation.
+    # Recent bodies define init_cudagraph_manager on the DSpark class itself.
+    # The audited @override semantics delegate to the superclass chain either
+    # way, so the adapter must wrap the owned implementation, not reject it.
     dspark_cls.init_cudagraph_manager = dflash_cls.init_cudagraph_manager
+    target = _install_target(monkeypatch, dspark_cls)
+    assert patch_dspark_draft_role_sep.apply_to_module(target)
+    hcu_wrapped = dspark_cls.__dict__["init_cudagraph_manager"]
+    assert getattr(hcu_wrapped, patch_dspark_draft_role_sep._WRAPPER, False)
+
+    # The owned implementation is the audited original: the wrapper must
+    # still grow the eager replay tail on the built manager.
+    spec = dspark_cls(SimpleNamespace(), "cpu")
+    spec.model = spec.load_draft_model(object(), set())
+    spec.init_cudagraph_manager(None)
+    mgr = spec.query_cudagraph_manager
+    assert getattr(mgr.run_fullgraph,
+                   patch_dspark_draft_role_sep._TAIL_WRAPPER)
+
+
+def test_dspark_draft_role_sep_rejects_shipped_new_api(monkeypatch):
+    monkeypatch.setattr(
+        "vllm.distributed.get_tensor_model_parallel_world_size", lambda: 2
+    )
+    dflash_cls, dspark_cls = _make_speculator_cls()
+    # The target already ships the role-separated helpers: the audited
+    # migration is obsolete and must not patch on top of it.
+    dspark_cls._markov_sample = lambda *args, **kwargs: None
     target = _install_target(monkeypatch, dspark_cls)
     with pytest.raises(patch_dspark_draft_role_sep.PatchCompatibilityError):
         patch_dspark_draft_role_sep.apply_to_module(target)

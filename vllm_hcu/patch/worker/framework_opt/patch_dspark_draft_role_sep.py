@@ -308,14 +308,16 @@ def apply_to_module(module: ModuleType) -> bool:
         TARGETS[1],
         positional=("self", "target_model", "target_attn_layer_names"),
     )
-    # The DSpark class must NOT own init_cudagraph_manager yet; the audited
-    # original lives on a superclass (DFlashSpeculator).
+    # Mirror the audited @override semantics (877e): the wrapper calls the
+    # audited superclass chain either way. Recent bodies define
+    # init_cudagraph_manager on the DSpark class itself; older ones inherit
+    # it from DFlashSpeculator. Wrap whichever implementation the MRO finds.
     if "init_cudagraph_manager" in speculator_cls.__dict__:
-        raise PatchCompatibilityError(
-            f"{TARGETS[2]} is defined on the DSpark target itself; the "
-            "audited delegation expects the DFlashSpeculator implementation"
+        mgr_original = require_unpatched(
+            speculator_cls, "init_cudagraph_manager", TARGETS[2], _WRAPPER
         )
-    mgr_original = _mro_original(speculator_cls, "init_cudagraph_manager")
+    else:
+        mgr_original = _mro_original(speculator_cls, "init_cudagraph_manager")
     require_exact_signature(
         mgr_original,
         TARGETS[2],
