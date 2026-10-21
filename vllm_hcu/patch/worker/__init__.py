@@ -267,8 +267,13 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_mla_gate")),
     # Must be applied after reference_paths: it wraps the
     # forward_attn_residual that adapter installs and captures it as the
-    # non-SP chain. Dormant (marker only) unless VLLM_K3_SP_MOE=1.
+    # non-SP chain. Armed by default; VLLM_HCU_K3_SP_MOE=0 disarms it.
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_sp_moe")),
+    # Must be applied after sp_moe: it reads sp_moe's SP_LL_TAG to prove a
+    # shrunken LL dispatch buffer belongs to an SP-managed layer. Shrinks
+    # FusedMoEConfig.max_num_tokens to ceil(stock/TP) while the SP switch is
+    # armed; fully inert otherwise.
+    _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_ll_shrink")),
     # All GDN deltas bind Qwen's module-local symbols/class only.  The
     # canonical causal-conv module and the shared GDN base remain vLLM-owned
     # so Kimi, Olmo, MambaMixer, MambaMixer2, and ShortConv are not patched by

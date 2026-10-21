@@ -282,6 +282,11 @@ _MARKER = "_vllm_hcu_kimi_k3_sp_moe_applied"
 _INIT_WRAPPER = "_vllm_hcu_kimi_k3_sp_moe_init_wrapper"
 _FORWARD_WRAPPER = "_vllm_hcu_kimi_k3_sp_moe_forward_wrapper"
 _LAYER_STATE = "_vllm_hcu_kimi_k3_sp_moe_state"
+# Tag written onto the layer's MoERunner (layer.mlp.experts) once SP
+# enablement succeeds. The LL-shrink patch (patch_kimi_k3_ll_shrink) reads
+# it to prove that a shrunken dispatch buffer belongs to an SP-managed
+# runner.
+SP_LL_TAG = "_vllm_hcu_kimi_k3_sp_moe_ll_ok"
 
 # Resolved once at apply time when the switch is on.
 _role_sep_enabled = None
@@ -697,6 +702,7 @@ def _maybe_enable_layer(layer, decoder_cls, logger) -> _SpState | None:
         ENV_SWITCH,
         tp_size,
     )
+    setattr(moe.experts, SP_LL_TAG, True)
     return _SpState(tp_size, get_tensor_model_parallel_rank(), runner)
 
 
