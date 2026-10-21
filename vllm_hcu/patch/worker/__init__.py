@@ -408,6 +408,12 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(
         _adapter("framework_opt", "patch_dspark_draft_role_sep"),
     ),
+    # Must stay after every adapter that replaces DSpark draft loader
+    # symbols (role separation above): it wraps whatever is installed at
+    # callback time by object identity, not by rebinding module globals.
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_smoke_draft_guard"),
+    ),
     _CallbackSpec(_adapter("framework_opt", "patch_gpu_ubatch_wrapper")),
     _CallbackSpec(_adapter("framework_opt", "patch_ubatch_utils")),
     _CallbackSpec(_adapter("framework_opt", "patch_all2all"), feature="deepep"),
