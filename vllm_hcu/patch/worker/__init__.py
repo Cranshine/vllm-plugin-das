@@ -265,6 +265,10 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_eplb_model")),
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_reference_paths")),
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_mla_gate")),
+    # Must be applied after reference_paths: it wraps the
+    # forward_attn_residual that adapter installs and captures it as the
+    # non-SP chain. Dormant (marker only) unless VLLM_K3_SP_MOE=1.
+    _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_sp_moe")),
     # All GDN deltas bind Qwen's module-local symbols/class only.  The
     # canonical causal-conv module and the shared GDN base remain vLLM-owned
     # so Kimi, Olmo, MambaMixer, MambaMixer2, and ShortConv are not patched by
