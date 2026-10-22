@@ -277,6 +277,38 @@ TARGETS = (
 )
 ENV_SWITCH = "VLLM_HCU_K3_SP_MOE"
 
+# User-visible SP messages are routed through the ``vllm`` root logger.
+# ``init_logger(__name__)`` hands back a child logger with NO handler of
+# its own: the vLLM dictConfig attaches the StreamHandler to the ``vllm``
+# logger only (its own ``propagate`` is False), so INFO-level records from
+# the ``vllm_hcu.*`` child never reach any handler and are silently
+# dropped -- the enablement banner, the whitelist admission line and the
+# clamp line all vanished from server logs even while the patch was fully
+# live. ``vllm.logger.logger`` is that configured root instance (and
+# carries the same monkey-patched ``info_once``). Lazy import keeps the
+# module import free of body-vllm side effects, matching this file's
+# style; module-level names stay monkeypatch-able for the test suite.
+_INFO_ONCE = None
+_WARN = None
+
+
+def _vllm_info_once(msg: str, *args) -> None:
+    if _INFO_ONCE is not None:
+        _INFO_ONCE(msg, *args)
+        return
+    from vllm.logger import logger as _vllogger
+
+    _vllogger.info_once(msg, *args)
+
+
+def _vllm_warn(msg: str, *args) -> None:
+    if _WARN is not None:
+        _WARN(msg, *args)
+        return
+    from vllm.logger import logger as _vllogger
+
+    _vllogger.warning(msg, *args)
+
 _ROLE_SEP_MODULE = "vllm.models.kimi_k3.role_separation"
 _MARKER = "_vllm_hcu_kimi_k3_sp_moe_applied"
 _INIT_WRAPPER = "_vllm_hcu_kimi_k3_sp_moe_init_wrapper"
@@ -483,7 +515,7 @@ def _admit_latent_hidden_size(logger) -> tuple[int, int]:
         sizes.append(_LL_ADMIT_HIDDEN_SIZE)
         sizes.sort()
         admitted += 1
-        logger.info_once(
+        _vllm_info_once(
             "SP-MoE: %s now admits hidden size %d (Kimi-K3 latent width).",
             class_name,
             _LL_ADMIT_HIDDEN_SIZE,
@@ -896,7 +928,7 @@ def _clamp_ll_dispatch_slots(runner, tp_size: int, logger) -> None:
     if shrunk >= stock:
         return
     cfg.max_num_tokens = shrunk
-    logger.info_once(
+    _vllm_info_once(
         "Kimi-K3 SP-MoE: LL dispatch slots clamped %d -> %d "
         "(ceil(max_num_tokens/%d), floor %d).",
         stock,
@@ -988,7 +1020,7 @@ def _maybe_enable_layer(layer, decoder_cls, logger) -> _SpState | None:
 
         runner._maybe_reduce_shared_expert_output = shared_output_already_sharded
 
-    logger.info_once(
+    _vllm_info_once(
         "Kimi-K3 SP-MoE enabled (%s=1): o_proj reduce-scatter, MoE dispatch "
         "of ceil(N/%d) rows per TP rank, all-gather after MoE.",
         ENV_SWITCH,
@@ -1110,7 +1142,7 @@ def apply_to_module(module: ModuleType) -> bool:
     admitted, searched = _admit_latent_hidden_size(logger)
     _admitted_wide = admitted > 0
     if not _admitted_wide and searched == 0:
-        logger.warning_once(
+        _vllm_warn(
             "SP-MoE: no DeepEP-LL prepare/finalize whitelist module was "
             "found; the %d-wide latent path keeps whatever gate this "
             "deployment ships.",
