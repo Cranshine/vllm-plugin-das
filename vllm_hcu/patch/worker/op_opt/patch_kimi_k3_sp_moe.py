@@ -282,6 +282,25 @@ _MARKER = "_vllm_hcu_kimi_k3_sp_moe_applied"
 _INIT_WRAPPER = "_vllm_hcu_kimi_k3_sp_moe_init_wrapper"
 _FORWARD_WRAPPER = "_vllm_hcu_kimi_k3_sp_moe_forward_wrapper"
 _LAYER_STATE = "_vllm_hcu_kimi_k3_sp_moe_state"
+# Tag written onto the layer's MoERunner (layer.mlp.experts) once SP
+# enablement succeeds. It marks the only runners whose DeepEP-LL
+# dispatch settings this patch is allowed to touch: the same enablement
+# clamps THAT runner's ``FusedMoEConfig.max_num_tokens`` to the SP row
+# window (see _clamp_ll_dispatch_slots, called by _maybe_enable_layer).
+# Runners without the tag keep stock binary config: never clamped, the
+# SP code never reads or writes their settings. This is what scopes the
+# clamp to Kimi-K3 SP layers -- Kimi-K3 only runs these MoE layers, and
+# any other model in-process (or the Kimi MTP / DSpark draft blocks,
+# which sp_moe skips by design) never reaches this code.
+SP_LL_TAG = "_vllm_hcu_kimi_k3_sp_moe_ll_ok"
+
+# Lower bound for the shrunken LL dispatch budget. The clamp is a
+# resource optimization, never an accuracy constraint: if a tiny row
+# window would ask for fewer slots than the kernels' smallest sensible
+# tile batch, keep enough slots for the hardware instead of chasing the
+# exact ratio. TP8 main targets (decode window 8) compute to 16 here and
+# are unaffected; the floor only bites hypothetically small windows.
+_LL_SLOTS_FLOOR = 16
 
 # Resolved once at apply time when the switch is on.
 _role_sep_enabled = None
@@ -609,6 +628,59 @@ def _wrap_shared_experts(shared: torch.nn.Module, tp_size: int) -> None:
     shared.forward = sp_shared_forward
 
 
+def _clamp_ll_dispatch_slots(runner, tp_size: int, logger) -> None:
+    """Shrink the latched layer's LL dispatch budget to the SP row window.
+
+    Called from ``_maybe_enable_layer`` immediately AFTER ``SP_LL_TAG``
+    is set, so no code path can observe a clamped-but-untagged or
+    tagged-but-unclamped runner: the two flips are one enablement
+    transaction on this single-threaded construction path.
+
+    ``FusedMoEConfig.max_num_tokens`` is the single seed field of the
+    DeepEP-LL chain: the all2all args derive
+    ``max_num_tokens_per_dp_rank`` / ``max_tokens_per_rank`` from it,
+    and the masked-GEMM ``estimate_expected_m`` clamps through the same
+    value. SP dispatches ``ceil(N/tp_size)`` rows per rank, so a buffer
+    sized for ``N`` wastes ``1 - 1/tp_size`` of its slots. The clamp
+    runs during layer enablement, before the MoE factory builds the LL
+    handle and workspace from this config, so every derived buffer is
+    sized once, correctly.
+
+    Scope: this runner was located from a ``use_attn_residuals`` Kimi
+    MoE decoder layer and has just been latched, so the clamp applies
+    only to Kimi-K3 SP layers. Any other model's MoE layers in-process,
+    and the Kimi MTP / DSpark draft blocks (sp_moe deliberately skips
+    them), never reach this function and keep the stock config.
+
+    The function shares the ``FusedMoEConfig`` instance with the MoE
+    factory: mutating the attribute in place (never rebinding) is what
+    propagates the new slot count to the LL handle and the expected_m
+    clamp on the same object.
+    """
+    cfg = getattr(runner, "moe_config", None)
+    stock = getattr(cfg, "max_num_tokens", None)
+    if not isinstance(stock, int) or isinstance(stock, bool) or stock <= 1:
+        logger.warning_once(
+            "Kimi-K3 SP-MoE: runner %r exposes no usable max_num_tokens "
+            "(%r); LL dispatch slots left at stock.",
+            type(runner).__name__,
+            stock,
+        )
+        return
+    shrunk = max(_LL_SLOTS_FLOOR, -(-stock // tp_size))
+    if shrunk >= stock:
+        return
+    cfg.max_num_tokens = shrunk
+    logger.info_once(
+        "Kimi-K3 SP-MoE: LL dispatch slots clamped %d -> %d "
+        "(ceil(max_num_tokens/%d), floor %d).",
+        stock,
+        shrunk,
+        tp_size,
+        _LL_SLOTS_FLOOR,
+    )
+
+
 def _maybe_enable_layer(layer, decoder_cls, logger) -> _SpState | None:
     if not getattr(layer, "use_attn_residuals", False):
         return None
@@ -697,6 +769,13 @@ def _maybe_enable_layer(layer, decoder_cls, logger) -> _SpState | None:
         ENV_SWITCH,
         tp_size,
     )
+    # The enablement outcome is now final and irreversible (this is
+    # server construction, single-shot, no disable path): latch the tag
+    # first so the runner is identifiable, then shrink ITS OWN config to
+    # the SP window. One transaction: no observer can see the runner
+    # tagged-but-unclamped; nothing else can ever clamp an untagged one.
+    setattr(moe.experts, SP_LL_TAG, True)
+    _clamp_ll_dispatch_slots(runner, tp_size, logger)
     return _SpState(tp_size, get_tensor_model_parallel_rank(), runner)
 
 
