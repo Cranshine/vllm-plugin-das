@@ -277,7 +277,10 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     # non-SP chain. Armed by default; VLLM_HCU_K3_SP_MOE=0 disarms it.
     # SP enablement also clamps the LL dispatch slots of every runner it
     # latches (scope: Kimi-K3 SP layers only; MTP/DSpark draft layers are
-    # skipped and keep stock config).
+    # skipped and keep their own slot config). The 3584 whitelist
+    # admission, however, is process-wide at patch-apply time: if the
+    # draft build is ever enabled, its routed layers also resolve widths
+    # through the same body lists and will size at 3584 like the target.
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_sp_moe")),
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_mixed_kda")),
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_mixed_linear")),
