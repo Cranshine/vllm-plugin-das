@@ -274,7 +274,7 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_mla_gate")),
     # Must be applied after reference_paths: it wraps the
     # forward_attn_residual that adapter installs and captures it as the
-    # non-SP chain. Armed by default; VLLM_HCU_K3_SP_MOE=0 disarms it.
+    # non-SP chain. Opt-in: armed only with VLLM_HCU_K3_SP_MOE=1.
     # SP enablement also clamps the LL dispatch slots of every runner it
     # latches (scope: Kimi-K3 SP layers only; MTP/DSpark draft layers are
     # skipped and keep their own slot config). The 3584 whitelist
