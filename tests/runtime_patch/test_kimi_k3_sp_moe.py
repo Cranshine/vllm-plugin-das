@@ -246,14 +246,60 @@ def test_router_windows_the_global_suffix_mask():
             assert bool(out[v:].all()), f"rank {rank} padding rows must be masked"
 
 
-def test_router_skips_windowing_for_unrelated_masks():
-    """A mask that does not reach this rank's first window row is not a
-    global bitmap -- windowing must be skipped (caller keeps generic
-    masking) instead of True-padding unknown rows."""
-    short_mask = torch.tensor([False, True])  # length 2 < rank*S = 6
-    topk_ids = torch.zeros(3, 2, dtype=torch.long)
-    out = window_sp_padding_mask(short_mask, topk_ids, (2, 4))
-    assert out is short_mask
+def test_router_windows_below_window_start_as_padding():
+    """N < rank*S is legal (small batches): those windows are all padding.
+
+    Review repro N=1, TP=4, S=1: rank 0 keeps its real row; ranks 1-3 must
+    get all-True windows and dispatch nothing -- NOT keep a fake real row
+    behind the global end.
+    """
+    mask = torch.tensor([False])  # exactly one real token in the batch
+    for rank in range(4):
+        out = window_sp_padding_mask(
+            mask, torch.zeros(1, 2, dtype=torch.long), (rank, 4)
+        )
+        assert out.tolist() == ([False] if rank == 0 else [True])
+
+
+def test_router_total_kept_rows_match_n():
+    """Aggregate kept routing rows across ranks == N (review's table)."""
+    for N, TP in [(1, 4), (1, 16), (2, 8), (5, 4)]:
+        shard = -(-N // TP)  # SP republishes ceil(N/TP) rows per rank
+        mask = torch.zeros(N, dtype=torch.bool)  # N real rows, none padding
+        kept = 0
+        for rank in range(TP):
+            out = window_sp_padding_mask(
+                mask, torch.zeros(shard, 2, dtype=torch.long), (rank, TP)
+            )
+            kept += int((~out).sum())
+        assert kept == N, f"expected {N} dispatched rows, got {kept}"
+
+
+def test_router_total_kept_rows_match_real_rows_when_graph_padded():
+    """Graph-padded local batch (len(pad) > N): kept rows track real rows,
+    the padding-tail rows never dispatch."""
+    real, padded_len, TP = 2, 8, 4
+    shard = -(-padded_len // TP)  # the MoE sees P rows here, not N
+    mask = torch.tensor([i >= real for i in range(padded_len)])
+    kept = 0
+    for rank in range(TP):
+        out = window_sp_padding_mask(
+            mask, torch.zeros(shard, 2, dtype=torch.long), (rank, TP)
+        )
+        kept += int((~out).sum())
+    assert kept == real
+
+
+def test_router_treats_uncovered_window_rows_as_padding():
+    """Window coordinates past the bitmap's end True-pad (never fabricate
+    real rows). E.g. N=2, TP=4: rank 3's window [3, 4) starts past the
+    domain end, so its row is covered-but-unmapped -> True, no dispatch."""
+    out = window_sp_padding_mask(
+        torch.tensor([False, True]),
+        torch.zeros(1, 2, dtype=torch.long),
+        (3, 4),
+    )
+    assert out.tolist() == [True]
 
 
 def test_router_windows_a_full_exactly_n_bitmap():
@@ -553,6 +599,30 @@ def test_capture_short_circuits_lazy_resolution(monkeypatch):
     comm = sp._phase_comm()
     assert getattr(comm, "available", None) is True
     assert sp._role_sep_resolved is False  # untouched while capturing
+
+
+# ---------------------------------------------------------------------------
+# P2: the stock reduce-scatter fallback has no c10d path -- enablement must
+# refuse SP when the TP pynccl comm cannot move data.
+# ---------------------------------------------------------------------------
+
+
+def test_tp_pynccl_probe_matches_utilization_gate(monkeypatch):
+    stub = types.SimpleNamespace(pynccl_comm=None)
+    monkeypatch.setattr(
+        "vllm.distributed.get_tp_group",
+        lambda: types.SimpleNamespace(device_communicator=stub),
+        raising=False,
+    )
+    assert sp._tp_pynccl_usable() is False  # comm absent
+
+    # disabled=True exactly mirrors the PyNcclCommunicator no-op gate: the
+    # reduced output would be returned unwritten.
+    stub.pynccl_comm = types.SimpleNamespace(disabled=True, available=False)
+    assert sp._tp_pynccl_usable() is False
+
+    stub.pynccl_comm = types.SimpleNamespace(disabled=False, available=True)
+    assert sp._tp_pynccl_usable() is True
 
 
 # ---------------------------------------------------------------------------

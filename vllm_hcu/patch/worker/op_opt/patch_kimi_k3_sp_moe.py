@@ -701,6 +701,24 @@ def _wrap_shared_experts(shared: torch.nn.Module, tp_size: int) -> None:
     shared.forward = sp_shared_forward
 
 
+def _tp_pynccl_usable() -> bool:
+    """Whether the shared TP pynccl comm can actually move data.
+
+    Everything the SP forward reduces or gathers in the capture phase, and
+    the stock fallback in the eager phase, routes through
+    ``device_communicator.reduce_scatter``, which has NO c10d fallback
+    (unlike all_gather/all_reduce): with pynccl disabled the PyNcclCommunicator
+    collectives no-op and the caller's ``torch.empty`` output is returned
+    unwritten. ``disabled`` is fixed at communicator construction
+    (VLLM_DISABLE_PYNCCL / missing NCCL lib / world_size == 1), so an
+    enablement-time probe is sound for eager and captured calls alike.
+    """
+    from vllm.distributed import get_tp_group
+
+    comm = getattr(get_tp_group().device_communicator, "pynccl_comm", None)
+    return _usable(comm)
+
+
 def _maybe_enable_layer(layer, decoder_cls, logger) -> _SpState | None:
     if not getattr(layer, "use_attn_residuals", False):
         return None
@@ -744,6 +762,13 @@ def _maybe_enable_layer(layer, decoder_cls, logger) -> _SpState | None:
             "VLLM_ROLE_SEP=1 but the auxiliary eager comm is unavailable; "
             "eager-phase SP collectives would fall back into the captured "
             "comm (RCCL mixed-role hazard)"
+        )
+    if not _tp_pynccl_usable():
+        problems.append(
+            "the TP pynccl communicator is unavailable (VLLM_DISABLE_PYNCCL, "
+            "missing NCCL library); device_communicator.reduce_scatter has "
+            "no c10d fallback, so every SP reduce-scatter -- capture path "
+            "included -- would return unwritten output"
         )
     if not getattr(vars(decoder_cls).get("forward_attn_residual"), _FORWARD_WRAPPER, False):
         problems.append("KimiDecoderLayer.forward_attn_residual was re-patched after SP-MoE")

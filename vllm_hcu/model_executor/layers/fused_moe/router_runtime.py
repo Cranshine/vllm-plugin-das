@@ -84,18 +84,18 @@ def window_sp_padding_mask(
     the layer body, where a Python attribute store is invisible to dynamo
     under torch.compile.
 
-    pad value=True assumes every missing tail row is padding (the global
-    bitmap always carries N real rows in non-PCP deployments, which SP
-    enablement requires). A mask that does not even reach this window's
-    first row is not a global bitmap, so windowing is skipped (rank 0 can
-    never skip) and the caller falls back to its generic suffix masking.
+    ``window`` is attached only where SP enablement holds (PCP/DCP
+    rejected), which makes the bitmap's coordinate domain global: its
+    length is the local padded batch and carries every real row. Window
+    coordinates past the bitmap's end are therefore covered rows that the
+    local length simply does not describe (legal whenever N < rank*S in
+    small batches) and are True-padded: their rows dispatch nothing. A
+    mask without the window attribute is returned untouched.
     """
     if window is None:
         return is_padding
     rank, tp_size = window
     shard = topk_ids.shape[0]
-    if is_padding.shape[0] < rank * shard:
-        return is_padding
     padded_len = shard * tp_size
     if is_padding.shape[0] < padded_len:
         is_padding = torch.nn.functional.pad(
