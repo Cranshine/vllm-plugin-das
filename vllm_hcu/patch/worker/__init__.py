@@ -274,7 +274,7 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_mla_gate")),
     # Must be applied after reference_paths: it wraps the
     # forward_attn_residual that adapter installs and captures it as the
-    # non-SP chain. Dormant (marker only) unless VLLM_K3_SP_MOE=1.
+    # non-SP chain. Opt-in: armed only with VLLM_HCU_K3_SP_MOE=1.
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_sp_moe")),
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_mixed_kda")),
     _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_mixed_linear")),

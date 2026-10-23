@@ -246,7 +246,8 @@ R5 ordering: see "Composition and provenance" above. Note also that the
 
 Rollback
 ========
-Unset ``VLLM_HCU_K3_SP_MOE`` (or set it to ``0``) and restart the workers.
+Leave ``VLLM_HCU_K3_SP_MOE`` unset (it defaults to off) or set it to ``0``
+and restart the workers.
 Nothing is installed in that case, and model state, weights and graphs are
 the same as before this patch.
 """
@@ -290,7 +291,7 @@ _warned_fallback = False
 
 
 def _switch_enabled() -> bool:
-    return os.environ.get(ENV_SWITCH, "1").strip().lower() in ("1", "true")
+    return os.environ.get(ENV_SWITCH, "0").strip().lower() in ("1", "true")
 
 
 def _custom_ops_enabled() -> bool:
