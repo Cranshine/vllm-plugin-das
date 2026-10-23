@@ -469,6 +469,93 @@ def test_op_entries_resolve_the_live_module(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# P2 regression: reload resets the role-separation accessors; the first
+# post-reload routing call must re-resolve them lazily (never during
+# capture), so eager and captured calls cannot split between the stock API
+# and pynccl.
+# ---------------------------------------------------------------------------
+
+
+def test_role_sep_accessors_rebind_after_simulated_reload(monkeypatch):
+    monkeypatch.setattr(
+        sp.torch.cuda, "is_current_stream_capturing", lambda: False, raising=False
+    )
+    monkeypatch.setattr(sp, "_role_sep_enabled", None, raising=False)
+    monkeypatch.setattr(sp, "_role_sep_aux_comm", None, raising=False)
+    monkeypatch.setattr(sp, "_role_sep_resolved", False, raising=False)
+
+    aux = types.SimpleNamespace(disabled=False, available=True)
+    fake_plugin = types.ModuleType(
+        "vllm_hcu.patch.worker.framework_opt._role_separation"
+    )
+    fake_plugin.role_separation_enabled = lambda: True
+    fake_plugin._get_aux_ar_comm = lambda: aux
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_hcu.patch.worker.framework_opt._role_separation",
+        fake_plugin,
+    )
+
+    assert sp._phase_comm() is aux
+    assert sp._role_sep_enabled is fake_plugin.role_separation_enabled
+    assert sp._role_sep_aux_comm is fake_plugin._get_aux_ar_comm
+    assert sp._role_sep_resolved is True
+
+
+def test_role_sep_unavailable_flips_resolved_flag(monkeypatch):
+    monkeypatch.setattr(
+        sp.torch.cuda, "is_current_stream_capturing", lambda: False, raising=False
+    )
+    monkeypatch.setattr(sp, "_role_sep_enabled", None, raising=False)
+    monkeypatch.setattr(sp, "_role_sep_aux_comm", None, raising=False)
+    monkeypatch.setattr(sp, "_role_sep_resolved", False, raising=False)
+    monkeypatch.setattr(sp, "_warned_fallback", True)  # silence warn-once
+    # Deterministic: both authority modules pretend to be missing-never-
+    # importable (setitem None forces ImportError even if one exists).
+    monkeypatch.setitem(
+        sys.modules, "vllm_hcu.patch.worker.framework_opt._role_separation", None
+    )
+    monkeypatch.setitem(sys.modules, "vllm.models.kimi_k3.role_separation", None)
+
+    # Neither module resolves in this tree (the role-separation prerequisite
+    # is not part of this PR): the stock-API destination is decided once and
+    # must NOT be re-probed on subsequent calls.
+    assert sp._phase_comm() is None
+    assert sp._role_sep_resolved is True
+
+    resolve_spy = []
+    real_resolve = sp._resolve_role_sep
+
+    def spy():
+        resolve_spy.append(1)
+        return real_resolve()
+
+    monkeypatch.setattr(sp, "_resolve_role_sep", spy)
+    assert sp._phase_comm() is None
+    assert resolve_spy == []  # latch held: no re-probe on the second call
+
+
+def test_capture_short_circuits_lazy_resolution(monkeypatch):
+    """Capture takes the pynccl branch before any resolution work."""
+    monkeypatch.setattr(
+        sp.torch.cuda, "is_current_stream_capturing", lambda: True, raising=False
+    )
+    monkeypatch.setattr(sp, "_role_sep_resolved", False, raising=False)
+    monkeypatch.setattr(
+        "vllm.distributed.get_tp_group",
+        lambda: types.SimpleNamespace(
+            device_communicator=types.SimpleNamespace(
+                pynccl_comm=types.SimpleNamespace(disabled=False, available=True)
+            )
+        ),
+        raising=False,
+    )
+    comm = sp._phase_comm()
+    assert getattr(comm, "available", None) is True
+    assert sp._role_sep_resolved is False  # untouched while capturing
+
+
+# ---------------------------------------------------------------------------
 # End-to-end-ish subprocess check: patch applies with the switch on and the
 # module compiles clean after the changes.
 # ---------------------------------------------------------------------------

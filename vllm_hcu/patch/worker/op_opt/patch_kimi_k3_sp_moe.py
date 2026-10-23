@@ -201,7 +201,10 @@ same predicate the role-sep shim uses:
   real invocation -- during capture (the capturing-stream check fires) and on
   each eager or compiled runtime call alike. The op entry points resolve this
   module through ``sys.modules``, so a later reload of the patch module
-  rebinds the role-separation accessors for the already-registered ops.
+  rebinds the role-separation accessors for the already-registered ops, and
+  ``_ensure_role_sep_resolved`` re-resolves them lazily on the first
+  post-reload routing call (never during capture), so no half-initialized
+  routing state is observable (review P2).
 
 Breakable cudagraph: the MoE body (including the shared expert's AG/RS) is
 captured by the HCU MoE replacement, so every SP collective inside a decode
@@ -312,9 +315,12 @@ _INIT_WRAPPER = "_vllm_hcu_kimi_k3_sp_moe_init_wrapper"
 _FORWARD_WRAPPER = "_vllm_hcu_kimi_k3_sp_moe_forward_wrapper"
 _LAYER_STATE = "_vllm_hcu_kimi_k3_sp_moe_state"
 
-# Resolved once at apply time when the switch is on.
+# Resolved lazily on first use and latched once per module instance --
+# including the no-role-sep outcome, which must not be re-probed (or
+# re-flipped) per collective.
 _role_sep_enabled = None
 _role_sep_aux_comm = None
+_role_sep_resolved = False
 _warned_fallback = False
 
 
@@ -372,6 +378,7 @@ def _phase_comm():
 
         comm = getattr(get_tp_group().device_communicator, "pynccl_comm", None)
         return comm if _usable(comm) else None
+    _ensure_role_sep_resolved()
     if _role_sep_enabled is None or not _role_sep_enabled():
         return None
     comm = _role_sep_aux_comm()
@@ -727,6 +734,7 @@ def _maybe_enable_layer(layer, decoder_cls, logger) -> _SpState | None:
         problems.append("prefill context parallel is unsupported")
     if getattr(parallel_config, "decode_context_parallel_size", 1) != 1:
         problems.append("decode context parallel is unsupported")
+    _ensure_role_sep_resolved()
     if (
         _role_sep_enabled is not None
         and _role_sep_enabled()
@@ -799,6 +807,22 @@ def _maybe_enable_layer(layer, decoder_cls, logger) -> _SpState | None:
 # ---------------------------------------------------------------------------
 
 
+def _ensure_role_sep_resolved() -> None:
+    """Rebind the accessors if this module's globals were reset (P2).
+
+    A reload of the patch module resets ``_role_sep_enabled`` /
+    ``_role_sep_aux_comm`` / ``_role_sep_resolved`` to their initial values
+    while the already-registered ops keep resolving the live module. Without
+    this lazy rebind, the marker path would leave the accessors unset and
+    eager calls would degrade to the stock group API while captured calls
+    ride pynccl -- mixed-role ordering under VLLM_ROLE_SEP=1. Resolution is
+    lazy instead of marker-path-eager, so the guarantee does not depend on
+    which re-apply path runs.
+    """
+    if not _role_sep_resolved:
+        _resolve_role_sep()
+
+
 def _resolve_role_sep() -> None:
     """Bind the role-separation accessors of this deployment's authority.
 
@@ -814,7 +838,9 @@ def _resolve_role_sep() -> None:
     group API is a consistent destination and we degrade with a warning
     instead of failing worker patch loading.
     """
-    global _role_sep_enabled, _role_sep_aux_comm
+    global _role_sep_enabled, _role_sep_aux_comm, _role_sep_resolved
+
+    _role_sep_resolved = True
 
     from vllm.logger import init_logger
 
