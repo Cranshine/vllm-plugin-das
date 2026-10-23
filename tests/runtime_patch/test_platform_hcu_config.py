@@ -2226,6 +2226,97 @@ def test_fused_qwen3_rms_rope_effective_policy_partitions_persistent_cache(
     )
 
 
+@pytest.mark.parametrize(
+    ("master", "feature", "expected"),
+    [
+        ("0", "0", False),
+        ("0", "1", False),
+        ("1", "0", False),
+        ("1", "1", True),
+    ],
+)
+def test_k3_sp_moe_policy_is_finalized_before_config_hash(
+    monkeypatch: pytest.MonkeyPatch,
+    master: str,
+    feature: str,
+    expected: bool,
+) -> None:
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", master)
+    monkeypatch.setenv("VLLM_HCU_K3_SP_MOE", feature)
+
+    config = _validation_config(HcuFeatureConfig())
+    feature_config = patch_vllm_config.validate_and_update_hcu_config(config)
+
+    assert feature_config.k3_sp_moe is expected
+    assert get_hcu_config(config) == feature_config
+
+
+def test_k3_sp_moe_effective_policy_partitions_persistent_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A 0 -> 1 restart must not load the graph persisted for SP-off.
+
+    Review scenario: SP-on mutates o_proj.reduce_results and registers the
+    hcu_k3_sp_* collectives, neither of which participates in the vLLM
+    config hash by itself -- so the effective switch must be persisted.
+
+    The master also gates Qwen3 fusion and Qwen4Exp HC SP; hold both off so
+    only the K3 SP policy varies across the master here (otherwise the
+    master-off "collapse" equality would be broken by those siblings, as in
+    the Qwen3 test above). Pin the remaining master-gated sibling too so the
+    assertion never depends on the CI environment.
+    """
+    monkeypatch.setenv("VLLM_HCU_USE_FUSED_RMS_ROPE", "0")
+    monkeypatch.setenv("VLLM_HCU_QWEN4_EXP_HC_SP", "0")
+    monkeypatch.setenv("VLLM_HCU_DP_INT8_ALLGATHER", "0")
+
+    def cache_key(master: str, feature: str) -> str:
+        monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", master)
+        monkeypatch.setenv("VLLM_HCU_K3_SP_MOE", feature)
+        config = _validation_config(HcuFeatureConfig())
+        patch_vllm_config.validate_and_update_hcu_config(config)
+        return _vllm_hash(config.additional_config)
+
+    disabled_key = cache_key("1", "0")
+    disabled_graph = tmp_path / disabled_key / "graph.py"
+    disabled_graph.parent.mkdir()
+    disabled_graph.write_text("torch.ops.aten.reduce_scatter\n", encoding="utf-8")
+
+    enabled_key = cache_key("1", "1")
+    assert enabled_key != disabled_key
+    enabled_graph = tmp_path / enabled_key / "graph.py"
+    if not enabled_graph.exists():
+        enabled_graph.parent.mkdir()
+        enabled_graph.write_text(
+            "torch.ops.vllm.hcu_k3_sp_reduce_scatter\n", encoding="utf-8"
+        )
+    assert "hcu_k3_sp_reduce_scatter" in enabled_graph.read_text(encoding="utf-8")
+
+    # Master off collapse: SP is refused, so it cannot change any graph.
+    assert cache_key("0", "0") == cache_key("0", "1")
+    assert cache_key("0", "1") == disabled_key
+
+
+def test_hcu_feature_config_field_registries_stay_in_sync():
+    """A new HcuFeatureConfig field must hit every registry.
+
+    from_mapping rejects fields missing from _FEATURE_FIELDS (persisted
+    payloads become unloadable), and _BOOLEAN_FIELDS misses silently skip
+    type validation. This pins the trio: dataclass fields == field
+    registries, and every bool field is declared bool.
+    """
+    from dataclasses import fields
+
+    from vllm_hcu.patch import config as config_module
+
+    dataclass_names = {f.name for f in fields(HcuFeatureConfig)}
+    assert dataclass_names == set(config_module._FEATURE_FIELDS)
+    for field in fields(HcuFeatureConfig):
+        if field.type is bool:
+            assert field.name in config_module._BOOLEAN_FIELDS, field.name
+
+
 def test_varlen_flash_attention_uses_64_token_cache_blocks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -287,7 +287,6 @@ from __future__ import annotations
 
 import functools
 import importlib
-import os
 import sys
 from types import ModuleType
 
@@ -325,7 +324,19 @@ _warned_fallback = False
 
 
 def _switch_enabled() -> bool:
-    return os.environ.get(ENV_SWITCH, "0").strip().lower() in ("1", "true")
+    # Delegate verbatim to the envs parser: it is the single authority for
+    # how VLLM_HCU_K3_SP_MOE is spelled, and the same helper feeds the
+    # HcuFeatureConfig persistence that partitions vLLM's persistent
+    # compilation cache, so enablement and the cache key can never drift
+    # apart (review: config-hash partitioning for the SP switch).
+    try:
+        from vllm_hcu.platforms import envs as henvs
+
+        return henvs.k3_sp_moe_requested()
+    except Exception:
+        # Fail closed like _custom_ops_enabled: a foreign tree without the
+        # envs module has not deployed the SP patch set either.
+        return False
 
 
 def _custom_ops_enabled() -> bool:

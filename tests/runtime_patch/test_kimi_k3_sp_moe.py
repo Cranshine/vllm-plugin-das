@@ -626,6 +626,47 @@ def test_tp_pynccl_probe_matches_utilization_gate(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Config-hash partitioning: the SP switch must share ONE parser with the
+# persisted HcuFeatureConfig policy, or enablement and the persistent
+# compilation-cache key can drift apart across restarts (review P1).
+# ---------------------------------------------------------------------------
+
+
+def test_switch_enabled_is_sourced_from_the_envs_parser(monkeypatch):
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setenv("VLLM_HCU_K3_SP_MOE", "1")
+    assert sp._switch_enabled() is True
+    monkeypatch.delenv("VLLM_HCU_K3_SP_MOE")
+    assert sp._switch_enabled() is False
+
+    # Prove delegation, not a second parse: whatever the authority returns,
+    # the switch must repeat it verbatim. The persisted cache policy calls
+    # this same helper, so a future re-parse cannot reintroduce the drift.
+    sentinel = object()
+    monkeypatch.setattr(henvs, "k3_sp_moe_requested", lambda: sentinel)
+    assert sp._switch_enabled() is sentinel
+
+
+def test_env_surface_declares_the_sp_switch():
+    from vllm_hcu.platforms import envs as henvs
+
+    # Worker env propagation and tooling iterate this registry; a missing
+    # entry would make the resolved policy engine-only.
+    assert "VLLM_HCU_K3_SP_MOE" in henvs.hcu_vllm_environment_variables
+
+
+def test_feature_config_partitions_the_sp_switch():
+    from vllm_hcu.patch.config import HcuFeatureConfig
+
+    defaults = HcuFeatureConfig()
+    assert defaults.k3_sp_moe is False
+    flipped = defaults.with_updates(k3_sp_moe=True)
+    assert flipped.k3_sp_moe is True
+    assert flipped != defaults  # bool-affecting fields change the hash input
+
+
+# ---------------------------------------------------------------------------
 # End-to-end-ish subprocess check: patch applies with the switch on and the
 # module compiles clean after the changes.
 # ---------------------------------------------------------------------------

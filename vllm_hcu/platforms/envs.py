@@ -161,6 +161,32 @@ def dp_int8_allgather_enabled() -> bool:
     )
 
 
+def k3_sp_moe_requested() -> bool:
+    """Raw Kimi-K3 SP-MoE opt-in parse, shared with the SP patch.
+
+    Keep this the ONLY parser of ``VLLM_HCU_K3_SP_MOE``: the patch's
+    ``_switch_enabled`` delegates here, so its enablement decision and the
+    persisted compilation-cache partition can never disagree on how the
+    variable is spelled.
+    """
+    return os.environ.get("VLLM_HCU_K3_SP_MOE", "0").strip().lower() in (
+        "1",
+        "true",
+    )
+
+
+def k3_sp_moe_enabled() -> bool:
+    """Effective Kimi-K3 SP-MoE opt-in under the custom-op master.
+
+    The row-sharded forward rewires KimiDecoderLayer at patch-apply time
+    (``o_proj.reduce_results`` plus the ``hcu_k3_sp_*`` collectives), so the
+    resolved master-and-child result must be persisted before VllmConfig
+    computes its compilation-cache hash: opposite-mode AOT graphs cannot
+    share an entry.
+    """
+    return optional_custom_op_enabled(k3_sp_moe_requested())
+
+
 def glm53_router_gemv_enabled() -> bool:
     """Resolve the GLM-5.3 router GEMV under the custom-op master switch."""
 
@@ -702,6 +728,13 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # VLLM_HCU_USE_CUSTOM_OPS.
     "VLLM_HCU_QWEN4_EXP_HC_SP":
         qwen4_exp_hc_sp_enabled,
+
+    # Kimi-K3 SP-MoE row-sharded forward (opt-in). The SP patch's
+    # _switch_enabled delegates to k3_sp_moe_requested(); the effective
+    # master-and-child result is persisted into HcuFeatureConfig before
+    # VllmConfig.compute_hash so 0->1 restarts cannot reuse AOT graphs.
+    "VLLM_HCU_K3_SP_MOE":
+        k3_sp_moe_enabled,
 
     # gfx938 GLM5Next sparse-indexer K-cache page layout: "preshuffle"
     # (official 16x16 tiles, HCU Triton decode reader) or "normal"
