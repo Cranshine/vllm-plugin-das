@@ -126,6 +126,20 @@ Trap 2: graph capture and padding
   derived from ``hidden_states.shape[0]`` and the static TP rank. Under capture
   ``N`` is the captured batch size, so every shape and branch is baked once per
   graph and identical on every replay. No data-dependent shape, no host sync.
+* torch.compile removes "eager path" from that reasoning: a graph first
+  traced with ``N % TP == 0`` specializes Python shape branches away and vLLM
+  drops the resulting guards (the documented dropped-guard behavior behind
+  the always-pad precedent in ``patch_qwen4_exp_sp``). The layer body is
+  therefore branch-free in ``N``: the partial sums are padded
+  unconditionally (identity when already padded), the shard windows are
+  materialized with ``index_select`` over an index clamped into range plus a
+  multiplicative ``keep`` mask (padding rows alias the last real row, and the
+  row-wise kernels always receive exactly ``S`` finite rows -- softmax of
+  zeros is never computed), and every ``N``-derived conditional
+  (``valid == shard``, ``padded != num_tokens``, zero-row skips) is gone.
+  The MoE padding-mask window is likewise applied inside the router (which
+  always runs inside the opaque MoE custom op) instead of being published by
+  a Python attribute write the layer used to perform.
 * Pure decode with ``num_spec_tokens=7`` gives ``N = 8 * num_reqs`` (padded to
   the capture size), which is always divisible by 4, so padding costs nothing.
   Admission steps that mix spec and non-spec requests, DP dummy batches
@@ -175,10 +189,19 @@ same predicate the role-sep shim uses:
   obtained through ``role_separation._get_aux_ar_comm``; availability is
   verified at layer enablement so the eager phase can never silently fall
   back into the captured comm;
-* role-sep off/unavailable, or torch.compile tracing -> the stock
-  ``tensor_model_parallel_reduce_scatter`` / ``_all_gather`` (the same legacy
-  single-comm topology role-sep itself falls back to), with a warn-once so
-  the degraded routing is observable in the log.
+* role-sep off/unavailable -> the stock ``tensor_model_parallel_*``
+  ``reduce_scatter`` / ``_all_gather`` (the same legacy single-comm topology
+  role-sep itself falls back to), with a warn-once so the degraded routing is
+  observable in the log.
+* torch.compile is NOT a fallback case: both collectives are invoked through
+  registered custom ops (``vllm::hcu_k3_sp_reduce_scatter`` /
+  ``vllm::hcu_k3_sp_all_gather``). Dynamo treats them as opaque and executes
+  only the shape fake while tracing, so the routing predicates above never
+  run at trace time and never bake into the compiled graph; they run at every
+  real invocation -- during capture (the capturing-stream check fires) and on
+  each eager or compiled runtime call alike. The op entry points resolve this
+  module through ``sys.modules``, so a later reload of the patch module
+  rebinds the role-separation accessors for the already-registered ops.
 
 Breakable cudagraph: the MoE body (including the shared expert's AG/RS) is
 captured by the HCU MoE replacement, so every SP collective inside a decode
@@ -214,7 +237,12 @@ R1 latency: decode does 4 RCCL collectives per MoE layer instead of 2 ARs,
    kernels (``CudaCommunicator.all_reduce`` prefers them over pynccl on
    ROCm), while the RS/AG here go to raw pynccl. At ``N <= 128`` both the
    a2a and the GEMM are latency-bound, so the net gain must be measured.
-   Follow-up: use ``ca_comm.custom_reduce_scatter`` / ``custom_all_gather``
+   The compile-safe rewrite adds small constant costs even on already
+   padded batches: one unconditional F.pad copy of the ``o_proj`` partial
+   (aten returns a clone rather than the input) and an ``index_select``
+   gather of ``S x B x H`` rows from ``block_residual`` where the old code
+   took a view. Follow-up: use
+   ``ca_comm.custom_reduce_scatter`` / ``custom_all_gather``
    for the captured phase (same approach as ``patch_qwen4_exp_sp``, which
    tries custom kernels first), or cross-layer SP that keeps ``prefix_sum``
    and ``block_residual`` sharded and AGs only the normed attention input.
@@ -331,10 +359,14 @@ def _usable(comm) -> bool:
 
 
 def _phase_comm():
-    """PyNccl comm owning this call's role, or None for the group API."""
+    """PyNccl comm owning this call's role, or None for the group API.
 
-    if torch.compiler.is_compiling():
-        return None
+    Only executed at real invocation time. While dynamo traces, the two SP
+    collectives are opaque custom ops whose fake impl answers shapes, so this
+    predicate never runs at trace time and no routing decision is baked into
+    a compiled graph (P1: a compile-time "no role separation" fallback would
+    mix communicator roles during prefill/decode interleaving).
+    """
     if torch.cuda.is_current_stream_capturing():
         from vllm.distributed import get_tp_group
 
@@ -354,9 +386,8 @@ def _warn_fallback(phase: str) -> None:
 
         init_logger(__name__).warning(
             "SP-MoE %s routed through the stock group API (no role comm "
-            "available: tracing or role-sep disabled). If VLLM_ROLE_SEP=1 "
-            "and this appears outside tracing, RCCL mixed-role hazards are "
-            "possible -- pause traffic and check the aux comm.",
+            "available: role separation disabled). If a role-separated "
+            "topology was expected, pause traffic and check the aux comm.",
             phase,
         )
 
@@ -368,9 +399,12 @@ def _sp_reduce_scatter(x: torch.Tensor, tp_size: int) -> torch.Tensor:
         _warn_fallback("reduce_scatter")
         from vllm.distributed import tensor_model_parallel_reduce_scatter
 
-        return tensor_model_parallel_reduce_scatter(x, dim=0)
-    out = x.new_empty((x.shape[0] // tp_size, *x.shape[1:]))
-    comm.reduce_scatter(out, x)
+        out = tensor_model_parallel_reduce_scatter(x, dim=0)
+    else:
+        out = x.new_empty((x.shape[0] // tp_size, *x.shape[1:]))
+        comm.reduce_scatter(out, x)
+    # Custom-op outputs must never alias their inputs.
+    assert out.data_ptr() != x.data_ptr()
     return out
 
 
@@ -381,10 +415,63 @@ def _sp_all_gather(x: torch.Tensor, tp_size: int) -> torch.Tensor:
         _warn_fallback("all_gather")
         from vllm.distributed import tensor_model_parallel_all_gather
 
-        return tensor_model_parallel_all_gather(x, dim=0)
-    out = x.new_empty((x.shape[0] * tp_size, *x.shape[1:]))
-    comm.all_gather(out, x)
+        out = tensor_model_parallel_all_gather(x, dim=0)
+    else:
+        out = x.new_empty((x.shape[0] * tp_size, *x.shape[1:]))
+        comm.all_gather(out, x)
+    assert out.data_ptr() != x.data_ptr()
     return out
+
+
+# Custom-op wrappers: opaque to dynamo so the phase-routed communicator
+# selection above survives torch.compile (P1 fix). The entry points bounce
+# through sys.modules so an already-registered op always calls the code of
+# the module object currently occupying this name, even after a reload that
+# re-resolved the role-separation accessors.
+
+_SP_OPS_REGISTERED = False
+
+
+def _sp_reduce_scatter_op_entry(x: torch.Tensor, tp_size: int) -> torch.Tensor:
+    live = sys.modules[__name__]
+    return live._sp_reduce_scatter(x, tp_size)
+
+
+def _sp_all_gather_op_entry(x: torch.Tensor, tp_size: int) -> torch.Tensor:
+    live = sys.modules[__name__]
+    return live._sp_all_gather(x, tp_size)
+
+
+def _sp_reduce_scatter_fake(x: torch.Tensor, tp_size: int) -> torch.Tensor:
+    return x.new_empty((x.shape[0] // tp_size, *x.shape[1:]))
+
+
+def _sp_all_gather_fake(x: torch.Tensor, tp_size: int) -> torch.Tensor:
+    return x.new_empty((x.shape[0] * tp_size, *x.shape[1:]))
+
+
+def _ensure_custom_ops_registered() -> None:
+    global _SP_OPS_REGISTERED
+    if _SP_OPS_REGISTERED:
+        return
+    # Registry-based guard: re-running direct_register_custom_op on the same
+    # names would re-define the schema and raise.
+    if not hasattr(torch.ops.vllm, "hcu_k3_sp_reduce_scatter"):
+        from vllm.utils.torch_utils import direct_register_custom_op
+
+        direct_register_custom_op(
+            op_name="hcu_k3_sp_reduce_scatter",
+            op_func=_sp_reduce_scatter_op_entry,
+            mutates_args=[],
+            fake_impl=_sp_reduce_scatter_fake,
+        )
+        direct_register_custom_op(
+            op_name="hcu_k3_sp_all_gather",
+            op_func=_sp_all_gather_op_entry,
+            mutates_args=[],
+            fake_impl=_sp_all_gather_fake,
+        )
+    _SP_OPS_REGISTERED = True
 
 
 # ---------------------------------------------------------------------------
@@ -458,7 +545,17 @@ def _sp_forward_attn_residual(
     shard = -(-num_tokens // tp_size)
     padded = shard * tp_size
     start = state.tp_rank * shard
-    valid = max(0, min(shard, num_tokens - start))
+
+    # Branch-free window arithmetic (P1: dynamo specializes shape branches
+    # to the first traced token count and vLLM drops the guards). Rows
+    # [start, start + shard) of the padded domain, with padding rows aliased
+    # onto the last real row (always defined for N >= 1) and zeroed through
+    # the multiplicative mask after every row-wise kernel. No slice is ever
+    # taken past N, so no guard depends on the token count.
+    idx = torch.arange(start, start + shard, device=hidden_states.device)
+    keep = (idx < num_tokens).unsqueeze(-1).to(hidden_states.dtype)
+    # Padding rows alias the last real row (always defined for N >= 1).
+    idx = idx.clamp(max=num_tokens - 1)
 
     # Full (replicated) domain: identical to the reference path.
     prefix_sum = hidden_states
@@ -475,91 +572,59 @@ def _sp_forward_attn_residual(
         prefix_sum = None
 
     hidden_states = self.input_layernorm(hidden_states)
-    # o_proj.reduce_results is False on SP layers: TP partial sums.
+    # o_proj.reduce_results is False on SP layers: TP partial sums. Pad is
+    # unconditional and free when N is already padded.
     attn_partial = self._run_self_attn(positions, hidden_states)
-    if padded != num_tokens:
-        attn_partial = torch.nn.functional.pad(
-            attn_partial, (0, 0, 0, padded - num_tokens)
-        )
-    attn_local = _sp_reduce_scatter(attn_partial, tp_size)
+    attn_full = torch.nn.functional.pad(
+        attn_partial, (0, 0, 0, padded - num_tokens)
+    )
+    attn_local = torch.ops.vllm.hcu_k3_sp_reduce_scatter(attn_full, tp_size)
 
-    # Row-sharded domain: local row i is global row start + i.
+    # Row-sharded domain: local row i is global row start + i. Padding rows
+    # are exactly zero: the global padding suffix carries zero partial sums
+    # on every rank (same N everywhere), and `keep` zeroes the rows the
+    # gather aliased.
     if prefix_sum is None:
         prefix_local = attn_local
-    elif valid == shard:
-        prefix_local = prefix_sum[start : start + shard] + attn_local
     else:
-        prefix_local = attn_local.clone()
-        if valid:
-            prefix_local[:valid].add_(prefix_sum[start : start + valid])
+        prefix_local = prefix_sum.index_select(0, idx) * keep + attn_local
 
     mlp_valid_blocks = self.prev_valid_blocks + (
         1 if self.is_block_write_layer else 0
     )
     if mlp_valid_blocks <= 0:
         hidden_local = prefix_local
-    elif valid == shard:
-        hidden_local = _attn_res(
-            prefix_local,
-            block_residual[start : start + shard],
-            self.mlp_res_proj,
-            self.mlp_res_norm,
-            mlp_valid_blocks,
-        )
     else:
-        # Padding rows have no block_residual row; keep them zero.
-        # Invariant: start + valid <= N because valid = min(shard, N - start),
-        # so every block_residual[start:start + valid] below stays in range.
-        hidden_local = torch.zeros_like(prefix_local)
-        if valid:
-            hidden_local[:valid] = _attn_res(
-                prefix_local[:valid],
-                block_residual[start : start + valid],
+        # The kernel sees exactly `shard` finite rows (padding rows enter as
+        # zero prefix + a real row's residual and are zeroed by `keep`
+        # afterwards; the kernel is row-independent, so the aliasing is
+        # invisible and softmax-of-zero-rows is never computed).
+        res_window = block_residual.index_select(0, idx)
+        hidden_local = (
+            _attn_res(
+                prefix_local,
+                res_window,
                 self.mlp_res_proj,
                 self.mlp_res_norm,
                 mlp_valid_blocks,
             )
+            * keep
+        )
 
     hidden_local = self.post_attention_layernorm(hidden_local)
     if not state.checked:
         _check_runner(state.runner)
         state.checked = True
-    # The router's VLLM_MOE_SKIP_PADDING mask is a global-row suffix bitmap
-    # (model_runner builds it before the layers). topk_ids rows are now local
-    # window rows, so republish the mask in window coordinates: pad to full
-    # rows with True, then slice this rank's window. Restore right after so
-    # the next (non-SP or SP) layer sees the global mask again.
-    forward_context = None
-    try:
-        from vllm.forward_context import (
-            get_forward_context,
-            is_forward_context_available,
-        )
-
-        if is_forward_context_available():
-            forward_context = get_forward_context()
-            global_is_padding = getattr(forward_context, "is_padding", None)
-            if global_is_padding is not None:
-                padded_mask = torch.nn.functional.pad(
-                    global_is_padding, (0, padded - num_tokens), value=True
-                )
-                forward_context.is_padding = padded_mask[start : start + shard]
-            else:
-                forward_context = None
-    except ImportError:
-        forward_context = None
-    try:
-        hidden_local = self.mlp(hidden_local)
-    finally:
-        if forward_context is not None:
-            forward_context.is_padding = global_is_padding
+    # The router windows the global VLLM_MOE_SKIP_PADDING suffix bitmap to
+    # this rank's rows itself (see _attach_padding_window: the window lives
+    # on MoERunner.router, consumed inside the opaque MoE op).
+    hidden_local = self.mlp(hidden_local)
     prefix_local = prefix_local + hidden_local
 
-    # Back to the full domain for the next layer.
-    prefix_sum = _sp_all_gather(prefix_local, tp_size)
-    if padded != num_tokens:
-        prefix_sum = prefix_sum[:num_tokens]
-    return prefix_sum, block_residual
+    # Back to the full domain for the next layer. The gathered tensor has
+    # `padded` rows; the slice is always in range.
+    prefix_sum = torch.ops.vllm.hcu_k3_sp_all_gather(prefix_local, tp_size)
+    return prefix_sum[:num_tokens], block_residual
 
 
 # ---------------------------------------------------------------------------
@@ -588,6 +653,25 @@ def _find_o_proj(self_attn: torch.nn.Module, tp_size: int):
             f"{ENV_SWITCH}: o_proj must be a TP-{tp_size} reducing RowParallelLinear"
         )
     return o_proj
+
+
+def _attach_padding_window(moe, tp_rank: int, tp_size: int) -> None:
+    """Publish the SP row window to the runner's router.
+
+    The router consumes the global ``VLLM_MOE_SKIP_PADDING`` suffix bitmap
+    and needs this rank's window coordinates. Its ``_compute_routing`` runs
+    inside the opaque MoE custom op, i.e. at every real invocation; the
+    layer-side attribute write this replaces is invisible to dynamo under
+    torch.compile.
+    """
+    runner = getattr(moe, "experts", None)
+    router = getattr(runner, "router", None)
+    if router is None or not callable(getattr(router, "_compute_routing", None)):
+        raise PatchCompatibilityError(
+            f"{ENV_SWITCH}: MoERunner.router exposes no _compute_routing; "
+            "cannot route the SP padding-mask window to the router"
+        )
+    router._hcu_sp_padding_window = (tp_rank, tp_size)
 
 
 def _wrap_shared_experts(shared: torch.nn.Module, tp_size: int) -> None:
@@ -691,6 +775,15 @@ def _maybe_enable_layer(layer, decoder_cls, logger) -> _SpState | None:
             return shared_output
 
         runner._maybe_reduce_shared_expert_output = shared_output_already_sharded
+
+    # Compile-safe SP collectives (P1) + router-side padding-mask window.
+    # The window is consumed by the runner's router inside _compute_routing
+    # (which always runs inside the opaque MoE custom op); the layer body no
+    # longer publishes a windowed mask through an attribute write (invisible
+    # to dynamo). The gate linear is a ReplicatedRouting with no routing
+    # hook -- the window must live on the router (review P0).
+    _ensure_custom_ops_registered()
+    _attach_padding_window(moe, get_tensor_model_parallel_rank(), tp_size)
 
     logger.info_once(
         "Kimi-K3 SP-MoE enabled (%s=1): o_proj reduce-scatter, MoE dispatch "
@@ -833,11 +926,15 @@ __all__ = ["ENV_SWITCH", "PATCH_ID", "TARGET_MODULE", "TARGETS", "apply", "apply
 #
 # A1 dispatch rows: with VLLM_HCU_K3_SP_MOE=1, DeepEP LL dispatch per rank goes
 #    from N to ceil(pad(N)/4) rows, where pad(N) = 4*ceil(N/4). The
-#    is_padding republication below is REQUIRED for imbalanced DP steps:
-#    without it, every rank dispatches its padding rows and an 8-real-token
-#    step in a 128-row graph would dispatch 104 rows instead of 32 (and 8
-#    after the mask fix). Measure topk_ids.size(0) / DeepEP send counts on
-#    both balanced and imbalanced DP steps.
+#    router-side padding-window fix (MoERunner.router._hcu_sp_padding_window,
+#    consumed by window_sp_padding_mask inside the opaque MoE op) is REQUIRED
+#    for imbalanced DP steps: without windowed masking, every rank dispatches
+#    its padding rows and an 8-real-token step in a 128-row graph would
+#    dispatch 104 rows instead of 32 (and 8 after the mask fix). The window
+#    applies on the LightOp routing path (HcuGroupedTopKRouter._compute_routing);
+#    super()._compute_routing fallbacks keep the global suffix masking and
+#    are safe but skip the saving. Measure topk_ids.size(0) / DeepEP send
+#    counts on both balanced and imbalanced DP steps.
 # A2 numerics: same prompts with greedy sampling, switch 0 vs 1. Per-layer
 #    prefix_sum and final logits must match within bf16 tolerance (AR vs
 #    RS+AG ordering only). Greedy tokens should match, and spec-decode
