@@ -1055,6 +1055,22 @@ def test_expected_m_hint_scales_by_num_dispatchers():
         bdgm.BatchedDeepGemmExperts.estimate_expected_m(experts, 256, 64, 8)
         == 16
     )
+    # Discriminating multiplier case (review): with the OLD shape-16 inputs
+    # both the hinted and the no-dispatcher product round up to 16, so a
+    # memory mutation that drops the multiplier survives. Here the hinted
+    # estimate is 96*8*2 //64 = 24 -> round_up 32 while the mutated variant
+    # yields 3 -> 16, so this case fails without the multiplier.
+    experts = _expected_m_stub(8, local_tokens=96)
+    assert (
+        bdgm.BatchedDeepGemmExperts._hcu_estimate_expected_m(
+            experts, 64, 128, 2, 96
+        )
+        == 32
+    )
+    assert (
+        bdgm.BatchedDeepGemmExperts.estimate_expected_m(experts, 64, 128, 2)
+        == 32
+    )
 
 
 def test_expected_m_without_hint_keeps_upstream_warning_path():
