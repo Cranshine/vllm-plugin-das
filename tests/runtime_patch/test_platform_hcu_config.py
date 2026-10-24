@@ -13,6 +13,7 @@ import math
 import multiprocessing
 import os
 import pickle
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field, fields
@@ -3077,3 +3078,39 @@ def test_deepep_auto_keeps_glm_dp_ep_without_pcp():
     config.parallel_config.enable_expert_parallel = True
     config.parallel_config.all2all_backend = "deepep_low_latency"
     assert patch_vllm_config.validate_and_update_hcu_config(config).deepep_auto
+
+
+def test_engine_args_skip_list_covers_every_master_resolved_field():
+    """The create-engine-config retainment check must skip exactly the
+    fields the platform hook re-resolves from the environment
+    (validate_and_update_hcu_config's updates dict, minus the env
+    hcu_flash_attn_mode which is skipped conditionally). A new
+    master-gated field added to the updates dict without joining this
+    skip list rejects every launch that flips it (f6399dc follow-up:
+    k3_sp_moe launch failure).
+    """
+    source = (
+        Path(patch_engine_args.__file__).read_text(encoding="utf-8")
+    )
+    match = re.search(
+        r"if name in \((.*?)\) or", source, re.DOTALL
+    )
+    assert match is not None, "retainment skip list not found"
+    skip_list = set(re.findall(r'"([a-z0-9_]+)"', match.group(1)))
+    vllm_config_source = (
+        Path(patch_vllm_config.__file__).read_text(encoding="utf-8")
+    )
+    updates_match = re.search(
+        r"updates(?::[^=]+)? = \{(.*?)\n    \}", vllm_config_source, re.DOTALL
+    )
+    assert updates_match is not None, "updates dict not found"
+    persisted = set(
+        re.findall(r'"([a-z0-9_]+)":', updates_match.group(1))
+    )
+    assert persisted == {
+        "fused_qwen3_rms_rope",
+        "qwen4_exp_hc_sp",
+        "k3_sp_moe",
+        "dp_int8_allgather",
+    }
+    assert skip_list == persisted
