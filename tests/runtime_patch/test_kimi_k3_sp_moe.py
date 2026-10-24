@@ -635,17 +635,104 @@ def test_tp_pynccl_probe_matches_utilization_gate(monkeypatch):
 def test_switch_enabled_is_sourced_from_the_envs_parser(monkeypatch):
     from vllm_hcu.platforms import envs as henvs
 
+    # Effective policy (master AND child); pin the master so the matrix
+    # below reads exactly instead of depending on the master default.
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
     monkeypatch.setenv("VLLM_HCU_K3_SP_MOE", "1")
     assert sp._switch_enabled() is True
-    monkeypatch.delenv("VLLM_HCU_K3_SP_MOE")
+    monkeypatch.setenv("VLLM_HCU_K3_SP_MOE", "0")
     assert sp._switch_enabled() is False
 
-    # Prove delegation, not a second parse: whatever the authority returns,
-    # the switch must repeat it verbatim. The persisted cache policy calls
-    # this same helper, so a future re-parse cannot reintroduce the drift.
+    # Rollback matrix (review P2): the child switch stays configured while
+    # the operator turns the custom-ops master off to fall back. The
+    # shared envs helper must disable the install gate exactly like the
+    # persisted HcuFeatureConfig policy does, or the wrapper would stay
+    # installed and every SP-eligible layer would die at construction.
+    monkeypatch.setenv("VLLM_HCU_K3_SP_MOE", "1")
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    assert sp._switch_enabled() is False
+
+    # Prove delegation, not a second parse: whatever the effective
+    # authority returns, the switch repeats it verbatim. The persisted
+    # cache policy calls this same helper, so a future re-parse cannot
+    # reintroduce the drift.
     sentinel = object()
-    monkeypatch.setattr(henvs, "k3_sp_moe_requested", lambda: sentinel)
+    monkeypatch.setattr(henvs, "k3_sp_moe_enabled", lambda: sentinel)
     assert sp._switch_enabled() is sentinel
+
+
+def _make_target_module():
+    """Minimal vllm.models.kimi_k3.amd.linear stand-in for apply tests."""
+    module = types.ModuleType(sp.TARGET_MODULE)
+
+    class KimiDecoderLayer:
+        def __init__(self):
+            self.built = True
+
+        def forward_attn_residual(self, positions, hidden_states, block_residual):
+            return hidden_states
+
+        def _run_self_attn(self, positions, hidden_states):
+            return hidden_states
+
+    module.KimiDecoderLayer = KimiDecoderLayer
+    return module, KimiDecoderLayer
+
+
+def test_master_off_child_on_skips_sp_installation(monkeypatch):
+    """Full apply+construct under the rollback matrix: master off with the
+    child switch still set must NOT install the SP wrapper -- marker
+    disabled, original methods intact, construction and forward take the
+    stock path instead of raising from _maybe_enable_layer (review P2).
+    """
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setenv("VLLM_HCU_K3_SP_MOE", "1")
+
+    module, decoder = _make_target_module()
+    original_init = decoder.__init__
+    original_forward = decoder.forward_attn_residual
+
+    assert sp.apply_to_module(module) is True
+    assert getattr(module, sp._MARKER) == "disabled"
+    assert getattr(
+        vars(decoder).get("__init__"), sp._INIT_WRAPPER, False
+    ) is False
+    assert getattr(
+        vars(decoder).get("forward_attn_residual"), sp._FORWARD_WRAPPER, False
+    ) is False
+    assert decoder.__init__ is original_init
+    assert decoder.forward_attn_residual is original_forward
+
+    layer = decoder()
+    assert layer.built is True
+    assert not hasattr(layer, sp._LAYER_STATE)
+    assert layer.forward_attn_residual(None, "hs", None) == "hs"
+
+    # Re-application sees the disabled marker and stays out of the way.
+    assert sp.apply_to_module(module) is False
+
+
+def test_master_on_child_on_installs_wrapper_and_constructs_clean(monkeypatch):
+    """The positive triplet of the rollback test: master and child on wraps
+    the decoder, and constructing a non-SP-shaped layer leaves it on the
+    stock path (no state, no RuntimeError) instead of refusing it.
+    """
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.setenv("VLLM_HCU_K3_SP_MOE", "1")
+
+    module, decoder = _make_target_module()
+    assert sp.apply_to_module(module) is True
+    assert getattr(module, sp._MARKER) == "enabled"
+    assert getattr(
+        vars(decoder).get("__init__"), sp._INIT_WRAPPER, False
+    ) is True
+
+    layer = decoder()
+    assert layer.built is True
+    # The stub layer carries none of the SP shape markers, so
+    # _maybe_enable_layer declines it before any precondition check.
+    assert getattr(layer, sp._LAYER_STATE, None) is None
+    assert layer.forward_attn_residual(None, "hs", None) == "hs"
 
 
 def test_env_surface_declares_the_sp_switch():

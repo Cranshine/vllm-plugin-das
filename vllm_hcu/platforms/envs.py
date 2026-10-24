@@ -730,9 +730,11 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
         qwen4_exp_hc_sp_enabled,
 
     # Kimi-K3 SP-MoE row-sharded forward (opt-in). The SP patch's
-    # _switch_enabled delegates to k3_sp_moe_requested(); the effective
-    # master-and-child result is persisted into HcuFeatureConfig before
-    # VllmConfig.compute_hash so 0->1 restarts cannot reuse AOT graphs.
+    # _switch_enabled delegates to this k3_sp_moe_enabled() (master AND
+    # child) and the same effective result is persisted into
+    # HcuFeatureConfig before VllmConfig.compute_hash, so 0->1 restarts
+    # cannot reuse AOT graphs and a master-off rollback skips the SP
+    # install instead of failing at model construction.
     "VLLM_HCU_K3_SP_MOE":
         k3_sp_moe_enabled,
 

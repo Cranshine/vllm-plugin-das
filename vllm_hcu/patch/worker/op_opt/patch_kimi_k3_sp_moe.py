@@ -324,15 +324,20 @@ _warned_fallback = False
 
 
 def _switch_enabled() -> bool:
-    # Delegate verbatim to the envs parser: it is the single authority for
-    # how VLLM_HCU_K3_SP_MOE is spelled, and the same helper feeds the
+    # Delegate verbatim to the envs EFFECTIVE policy (master AND child).
+    # It is the install gate for this patch and the same helper feeds the
     # HcuFeatureConfig persistence that partitions vLLM's persistent
     # compilation cache, so enablement and the cache key can never drift
-    # apart (review: config-hash partitioning for the SP switch).
+    # apart. Using the raw child request here instead would keep the
+    # wrapper installed when an operator turns VLLM_HCU_USE_CUSTOM_OPS
+    # off to roll back: apply_to_module would still wrap the decoder and
+    # every SP-eligible layer would die in _maybe_enable_layer with
+    # "HCU custom ops are disabled" instead of falling back to the SP
+    # off path (review P2: skip SP installation under a disabled master).
     try:
         from vllm_hcu.platforms import envs as henvs
 
-        return henvs.k3_sp_moe_requested()
+        return henvs.k3_sp_moe_enabled()
     except Exception:
         # Fail closed like _custom_ops_enabled: a foreign tree without the
         # envs module has not deployed the SP patch set either.
