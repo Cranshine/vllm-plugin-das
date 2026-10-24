@@ -46,7 +46,7 @@ TP-sharded ``KimiMLP`` would need the same AG/RS pair and gains nothing from
 SP, since no dispatch happens there. Layers without attn residuals, such as
 the MTP block (``KimiDecoderLayer`` built with attn-res disabled, and the
 DSpark draft which reuses it), are also left alone: their eager warmup
-collectives never bypass the role-comm pairing that way. Every layer still
+collectives ride the same stock TP group APIs as before. Every layer still
 returns a full-row ``prefix_sum``, so SP and non-SP layers mix freely.
 
 ``KimiDecoderLayer.forward`` is not replaced: when ``use_attn_residuals`` is
@@ -172,47 +172,49 @@ capacity ``max_num_tokens`` only needs ``S <= N``. Ruling: no change. The
 minimal-change rule forbids touching ``batched_deep_gemm_moe.py`` without a
 demonstrated overestimate, and there is none.
 
-Collectives and role separation (``VLLM_ROLE_SEP``)
-===================================================
-``role_separation`` reroutes only TP ``all_reduce`` and splits by phase:
-captured ARs go to the TP pynccl comm, eager ARs go to the auxiliary comm.
-The stock group APIs would put the new collectives on new mixed-role pairs.
-On ROCm, an eager prefill ReduceScatter through the stock dispatcher would
-land on the TP pynccl comm that carries captured collectives, and a captured
-AllGather would land on the c10d comm that also serves eager collectives.
-This patch therefore picks the comm explicitly, per call, by phase -- the
-same predicate the role-sep shim uses:
+Collectives
+===========
+SP collectives use this deployment's stock single-comm topology -- there is
+no second communicator here and none is created:
 
-* capturing -> ``get_tp_group().device_communicator.pynccl_comm`` (the
-  captured-role comm, which already hosts the captured ARs);
-* eager with role-sep enabled -> the role-sep auxiliary comm (eager role),
-  obtained through ``role_separation._get_aux_ar_comm``; availability is
-  verified at layer enablement so the eager phase can never silently fall
-  back into the captured comm;
-* role-sep off/unavailable -> the stock ``tensor_model_parallel_*``
-  ``reduce_scatter`` / ``_all_gather`` (the same legacy single-comm topology
-  role-sep itself falls back to), with a warn-once so the degraded routing is
-  observable in the log.
+* capturing -> ``get_tp_group().device_communicator.pynccl_comm`` -- the
+  same comm the stock captured TP collectives use;
+* eager (prefill, DP dummies, warmup) -> the stock
+  ``tensor_model_parallel_*`` ``reduce_scatter`` / ``_all_gather`` group
+  API. Concretely the eager reduce-scatter lands on
+  ``device_communicator.reduce_scatter`` -- i.e. the TP pynccl comm, the
+  same one captured segments ride -- and the eager all-gather on c10d.
+  This is exactly where the stock eager TP collectives of the deployment
+  already go, so SP adds no new comm and no new comm pairing; every rank
+  issues the same sequence in the same stream order, so there is no
+  cross-comm ordering to break. A warn-once (per message) keeps the
+  routing observable.
+
+Consequence for the role-separation workstream: eager SP reduce-scatters
+SHARE the TP pynccl comm with captured work (today shared with all other
+stock eager RS traffic too). The moment a role-separated deployment gives
+eager collectives their own comm, this patch's eager routing must join it
+or refuse to enable -- that is that workstream's scope, deliberately not
+probed here (no role-separation accessors, no resolution latch).
+
 * torch.compile is NOT a fallback case: both collectives are invoked through
   registered custom ops (``vllm::hcu_k3_sp_reduce_scatter`` /
   ``vllm::hcu_k3_sp_all_gather``). Dynamo treats them as opaque and executes
-  only the shape fake while tracing, so the routing predicates above never
-  run at trace time and never bake into the compiled graph; they run at every
-  real invocation -- during capture (the capturing-stream check fires) and on
-  each eager or compiled runtime call alike. The op entry points resolve this
-  module through ``sys.modules``, so a later reload of the patch module
-  rebinds the role-separation accessors for the already-registered ops, and
-  ``_ensure_role_sep_resolved`` re-resolves them lazily on the first
-  post-reload routing call (never during capture), so no half-initialized
-  routing state is observable (review P2).
+  only the shape fake while tracing, so the routing predicate above never
+  runs at trace time and never bakes into the compiled graph; it runs at
+  every real invocation -- during capture (the capturing-stream check fires)
+  and on each eager or compiled runtime call alike. The op entry points
+  resolve this module through ``sys.modules``, so the already-registered ops
+  keep calling the live code even after a reload of the patch module.
 
 Breakable cudagraph: the MoE body (including the shared expert's AG/RS) is
 captured by the HCU MoE replacement, so every SP collective inside a decode
-step is captured alongside it. The per-call predicate below re-evaluates at
-capture time and selects the TP pynccl comm for captured segments, so capture
-and replay use the same communicator. Eager steps (prefill, DP dummies,
-warmup) select the aux comm; capturing and eager steps can interleave across
-steps without changing which comm each collective uses.
+step is captured alongside it. The per-call predicate re-evaluates at
+capture time and selects the TP pynccl comm for captured segments, so
+capture and replay use the same communicator. Eager steps keep the stock
+routing (reduce-scatter on TP pynccl, all-gather on c10d). Each collective's
+comm is fixed per phase, so interleaving prefill and decode never changes
+which comm a given call uses.
 
 Composition and provenance
 ==========================
@@ -230,8 +232,11 @@ enablement with runner validation, and the A1-A4 acceptance criteria are the
 claude design, adopted after its AR index-alignment proof refuted the GLM
 draft's runner-reduction stance. The custom-ops discipline (SP enablement
 requires ``henvs.custom_ops_enabled()``, matching the reference patch's
-runtime gate), the aux-comm availability preflight, and the warn-once on
-degraded comm routing are the GLM corrections, adopted after review.
+runtime gate), the TP-pynccl usability preflight, and the warn-once on
+stock-API routing are the GLM corrections, adopted after review. The
+role-separation support (aux-comm routing) that earlier drafts carried was
+removed from this PR by review decision; it belongs to the role-separation
+workstream.
 
 Known risks
 ===========
@@ -267,13 +272,7 @@ R4 coupling: depends on the HCU ``MoERunner`` reduction layout. The
    construction-time check fails hard if that layout changes. Also depends on
    ``o_proj`` being the last op of ``self_attn`` and on ``RowParallelLinear``
    reading ``reduce_results`` at call time.
-R5 ordering: see "Composition and provenance" above. Note also that the
-   enablement preflight calls ``_get_aux_ar_comm`` at model construction,
-   which builds the auxiliary NCCL communicator before memory profiling and
-   DeepEP buffer init instead of on the first forward (role_separation's
-   documented construction point). This is rank-symmetric and harmless for
-   correctness, but it moves RCCL buffer allocation earlier; keep it in mind
-   when interpreting memory-profile deltas.
+R5 ordering: see "Composition and provenance" above.
 
 Rollback
 ========
@@ -286,7 +285,6 @@ the same as before this patch.
 from __future__ import annotations
 
 import functools
-import importlib
 import sys
 from types import ModuleType
 
@@ -308,19 +306,10 @@ TARGETS = (
 )
 ENV_SWITCH = "VLLM_HCU_K3_SP_MOE"
 
-_ROLE_SEP_MODULE = "vllm.models.kimi_k3.role_separation"
 _MARKER = "_vllm_hcu_kimi_k3_sp_moe_applied"
 _INIT_WRAPPER = "_vllm_hcu_kimi_k3_sp_moe_init_wrapper"
 _FORWARD_WRAPPER = "_vllm_hcu_kimi_k3_sp_moe_forward_wrapper"
 _LAYER_STATE = "_vllm_hcu_kimi_k3_sp_moe_state"
-
-# Resolved lazily on first use and latched once per module instance --
-# including the no-role-sep outcome, which must not be re-probed (or
-# re-flipped) per collective.
-_role_sep_enabled = None
-_role_sep_aux_comm = None
-_role_sep_resolved = False
-_warned_fallback = False
 
 
 def _switch_enabled() -> bool:
@@ -368,7 +357,8 @@ class _SpState:
 
 
 # ---------------------------------------------------------------------------
-# Collectives: phase-routed so no communicator gains a second role.
+# Collectives: capture-time pynccl / eager-time stock group API -- the
+# deployment's stock single-comm topology, no second comm is created.
 # ---------------------------------------------------------------------------
 
 
@@ -381,38 +371,36 @@ def _usable(comm) -> bool:
 
 
 def _phase_comm():
-    """PyNccl comm owning this call's role, or None for the group API.
+    """TP pynccl comm for captured calls, None for eager ones.
 
     Only executed at real invocation time. While dynamo traces, the two SP
     collectives are opaque custom ops whose fake impl answers shapes, so this
     predicate never runs at trace time and no routing decision is baked into
-    a compiled graph (P1: a compile-time "no role separation" fallback would
-    mix communicator roles during prefill/decode interleaving).
+    a compiled graph (P1: a compile-time fallback would mix communicator
+    roles during prefill/decode interleaving). Eager calls intentionally
+    return None (the stock group API): a dedicated eager-role communicator
+    is role-separation workstream scope, not this PR's.
     """
     if torch.cuda.is_current_stream_capturing():
         from vllm.distributed import get_tp_group
 
         comm = getattr(get_tp_group().device_communicator, "pynccl_comm", None)
         return comm if _usable(comm) else None
-    _ensure_role_sep_resolved()
-    if _role_sep_enabled is None or not _role_sep_enabled():
-        return None
-    comm = _role_sep_aux_comm()
-    return comm if _usable(comm) else None
+    return None
 
 
 def _warn_fallback(phase: str) -> None:
-    global _warned_fallback
-    if not _warned_fallback:
-        _warned_fallback = True
-        from vllm.logger import init_logger
+    # warning_once dedupes per message, so no module-level "already warned"
+    # flag is needed (and none survives reloads). The stock-API route is the
+    # designed eager topology here; the warning exists so an operator who
+    # expected a dedicated eager comm notices where the collectives went.
+    from vllm.logger import init_logger
 
-        init_logger(__name__).warning(
-            "SP-MoE %s routed through the stock group API (no role comm "
-            "available: role separation disabled). If a role-separated "
-            "topology was expected, pause traffic and check the aux comm.",
-            phase,
-        )
+    init_logger(__name__).warning_once(
+        "SP-MoE %s uses the stock TP group API (expected without a "
+        "role-separated eager comm).",
+        phase,
+    )
 
 
 def _sp_reduce_scatter(x: torch.Tensor, tp_size: int) -> torch.Tensor:
@@ -449,8 +437,7 @@ def _sp_all_gather(x: torch.Tensor, tp_size: int) -> torch.Tensor:
 # Custom-op wrappers: opaque to dynamo so the phase-routed communicator
 # selection above survives torch.compile (P1 fix). The entry points bounce
 # through sys.modules so an already-registered op always calls the code of
-# the module object currently occupying this name, even after a reload that
-# re-resolved the role-separation accessors.
+# the module object currently occupying this name, even after a reload.
 
 _SP_OPS_REGISTERED = False
 
@@ -768,17 +755,6 @@ def _maybe_enable_layer(layer, decoder_cls, logger) -> _SpState | None:
         problems.append("prefill context parallel is unsupported")
     if getattr(parallel_config, "decode_context_parallel_size", 1) != 1:
         problems.append("decode context parallel is unsupported")
-    _ensure_role_sep_resolved()
-    if (
-        _role_sep_enabled is not None
-        and _role_sep_enabled()
-        and not _usable(_role_sep_aux_comm())
-    ):
-        problems.append(
-            "VLLM_ROLE_SEP=1 but the auxiliary eager comm is unavailable; "
-            "eager-phase SP collectives would fall back into the captured "
-            "comm (RCCL mixed-role hazard)"
-        )
     if not _tp_pynccl_usable():
         problems.append(
             "the TP pynccl communicator is unavailable (VLLM_DISABLE_PYNCCL, "
@@ -848,82 +824,6 @@ def _maybe_enable_layer(layer, decoder_cls, logger) -> _SpState | None:
 # ---------------------------------------------------------------------------
 
 
-def _ensure_role_sep_resolved() -> None:
-    """Rebind the accessors if this module's globals were reset (P2).
-
-    A reload of the patch module resets ``_role_sep_enabled`` /
-    ``_role_sep_aux_comm`` / ``_role_sep_resolved`` to their initial values
-    while the already-registered ops keep resolving the live module. Without
-    this lazy rebind, the marker path would leave the accessors unset and
-    eager calls would degrade to the stock group API while captured calls
-    ride pynccl -- mixed-role ordering under VLLM_ROLE_SEP=1. Resolution is
-    lazy instead of marker-path-eager, so the guarantee does not depend on
-    which re-apply path runs.
-    """
-    if not _role_sep_resolved:
-        _resolve_role_sep()
-
-
-def _resolve_role_sep() -> None:
-    """Bind the role-separation accessors of this deployment's authority.
-
-    Branch-dependent: the d-lwc line ships role separation inside the plugin
-    (``vllm_hcu.patch.worker.framework_opt._role_separation``, ported from
-    the body-side fix, public ``role_separation_enabled``), while other
-    trees carry it in the vLLM body
-    (``vllm.models.kimi_k3.role_separation``, ``_role_separation_enabled``).
-    The plugin module is preferred: binding the body module when the plugin
-    also builds its auxiliary comm would create a SECOND eager NCCL
-    communicator for the SP collectives to ride. When neither module exists
-    the deployment has no role separation at all, so the stock single-comm
-    group API is a consistent destination and we degrade with a warning
-    instead of failing worker patch loading.
-    """
-    global _role_sep_enabled, _role_sep_aux_comm, _role_sep_resolved
-
-    _role_sep_resolved = True
-
-    from vllm.logger import init_logger
-
-    logger = init_logger(__name__)
-
-    try:
-        plugin = importlib.import_module(
-            "vllm_hcu.patch.worker.framework_opt._role_separation"
-        )
-        enabled = getattr(plugin, "role_separation_enabled", None)
-        aux = getattr(plugin, "_get_aux_ar_comm", None)
-        if callable(enabled) and callable(aux):
-            _role_sep_enabled = enabled
-            _role_sep_aux_comm = aux
-            return
-    except Exception:
-        logger.debug(
-            "SP-MoE: plugin role-separation module unavailable", exc_info=True
-        )
-
-    try:
-        body = sys.modules.get(_ROLE_SEP_MODULE)
-        if body is None:
-            body = importlib.import_module(_ROLE_SEP_MODULE)
-        enabled = getattr(body, "_role_separation_enabled", None)
-        aux = getattr(body, "_get_aux_ar_comm", None)
-        if callable(enabled) and callable(aux):
-            _role_sep_enabled = enabled
-            _role_sep_aux_comm = aux
-            return
-    except Exception:
-        logger.debug(
-            "SP-MoE: body role-separation module unavailable", exc_info=True
-        )
-
-    logger.warning_once(
-        "SP-MoE: no role-separation module found (plugin or vLLM body); "
-        "SP collectives will use the stock group API on the shared TP "
-        "communicator, matching this deployment's no-role-sep topology."
-    )
-
-
 def apply_to_module(module: ModuleType) -> bool:
     target = load_exact_module(TARGET_MODULE, module)
     decoder = require_class(target, "KimiDecoderLayer", f"{TARGET_MODULE}.KimiDecoderLayer")
@@ -951,7 +851,6 @@ def apply_to_module(module: ModuleType) -> bool:
         positional=("self", "positions", "hidden_states", "block_residual"),
     )
     require_callable(decoder, "_run_self_attn", f"{TARGET_MODULE}.KimiDecoderLayer._run_self_attn")
-    _resolve_role_sep()
 
     from vllm.logger import init_logger
 
@@ -1011,12 +910,11 @@ __all__ = ["ENV_SWITCH", "PATCH_ID", "TARGET_MODULE", "TARGETS", "apply", "apply
 #    with the switch on, then replay mixed batch sizes. No shape mismatch, no
 #    capture error, and the output for each size equals an eager run of that
 #    size. All SP shapes are Python ints of N and the static TP rank.
-# A4 role separation and soak: with VLLM_ROLE_SEP=1 and
-#    VLLM_ROLE_SEP_STRICT=1, run NCCL_DEBUG=INFO with collective tracing.
-#    Every eager ReduceScatter and AllGather issued by this layer must be on
-#    the aux comm, every captured one on the TP pynccl comm, and the c10d TP
-#    comm must carry no new collectives. Then soak a long prefill/decode
-#    interleave (hours) with no RCCL hang: the shared-expert AG/RS now run
-#    between the captured DeepEP send and recv kernels, which is a new
-#    position for RCCL work on these comms.
+# A4 soak: the shared expert's AG/RS now run between the captured DeepEP
+#    send and recv kernels, which is a new position for RCCL work on these
+#    comms. Soak a long prefill/decode interleave (hours) with no RCCL hang.
+#    Eager SP collectives deliberately ride the same single-comm topology as
+#    every other eager TP collective in the deployment; when role-separated
+#    eager collectives land (a later workstream), repeat this soak with its
+#    env switch and strict collective tracing.
 # ---------------------------------------------------------------------------
