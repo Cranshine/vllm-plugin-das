@@ -162,12 +162,12 @@ def dp_int8_allgather_enabled() -> bool:
 
 
 def k3_sp_moe_requested() -> bool:
-    """Raw Kimi-K3 SP-MoE opt-in parse, shared with the SP patch.
+    """Raw Kimi-K3 SP-MoE opt-in parse (child switch only).
 
-    Keep this the ONLY parser of ``VLLM_HCU_K3_SP_MOE``: the patch's
-    ``_switch_enabled`` delegates here, so its enablement decision and the
-    persisted compilation-cache partition can never disagree on how the
-    variable is spelled.
+    Keep this the ONLY parser of ``VLLM_HCU_K3_SP_MOE`` spelling: it feeds
+    :func:`k3_sp_moe_enabled` (master AND child), which the platform
+    persists into the compilation-cache partition and the SP patch's
+    ``_switch_enabled`` delegates to, so neither can disagree on spelling.
     """
     return os.environ.get("VLLM_HCU_K3_SP_MOE", "0").strip().lower() in (
         "1",
