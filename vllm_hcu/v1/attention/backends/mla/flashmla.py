@@ -508,7 +508,6 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
             n_tile=n, m_split=m, num_decodes=num_decodes,
             query_len=query_len, pages_per_block=_pages_per_block,
             stamped=stamp.get((num_decodes, query_len)),
-            cap=_vp.capturing(),
             src_vmf=_vp.file_sha(__file__),
         )
         _vp.audit_seq_lens(
@@ -779,7 +778,6 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
             cache_pages=k_cache.shape[0],
             tile_rows=int(decode.scheduler_metadata.tile_scheduler_metadata.shape[0]),
             ns_rows=int(decode.scheduler_metadata.num_splits.shape[0]),
-            cap=_vp.capturing(),
         )
         if k_cache.dtype != _FP8_E4M3:
             k_cache = k_cache.view(_FP8_E4M3)

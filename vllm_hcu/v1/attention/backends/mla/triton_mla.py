@@ -635,7 +635,7 @@ class HcuTritonMLAImpl(TritonMLAImpl):
             qlen=query_len, heads=q_heads, rows=num_decodes,
             cache_pages=k_cache.shape[0],
             tile_rows=int(tile.shape[0]), ns_rows=int(nsplits.shape[0]),
-            sched_had=(sched is not None), cap=capturing(),
+            sched_had=(sched is not None),
             src_vmf=_vp.file_sha(__file__),
         )
         _vp.audit_seq_lens(
