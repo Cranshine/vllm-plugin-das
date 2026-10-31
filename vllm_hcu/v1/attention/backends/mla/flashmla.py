@@ -361,7 +361,24 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
             block_table_tensor[:, :demand_cols].unsqueeze(-1) * self._nc_subpage
         )
         bt3[:, :demand_cols].add_(self._nc_bt_arange)
+        # VMFPROBE (vmfaultfix branch): raw expanded-id audit between
+        # expansion and clamp; no-op inside capture.
+        from vllm_hcu.v1.attention.backends.mla import vmfprobe as _vp
+        _vp.audit_table(
+            "flash_fill_nc_bt",
+            bt3[:, :demand_cols].reshape(rows, -1),
+            pool_pages, rows,
+            dict(phase="raw", demand_cols=demand_cols,
+                 pages_per_block=self._nc_subpage,
+                 src_vmf=_vp.file_sha(__file__)),
+        )
         bt3[:, :demand_cols].clamp_(min=0, max=pool_pages - 1)
+        _vp.audit_table(
+            "flash_fill_nc_bt",
+            bt3[:, :demand_cols].reshape(rows, -1),
+            pool_pages, rows,
+            dict(phase="post", demand_cols=demand_cols),
+        )
 
     def _build_nc_decode(
         self,
@@ -481,6 +498,22 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
             )
         self._fill_nc_bt(
             rows, cols, demand_cols, pool_pages, block_table_tensor
+        )
+        # VMFPROBE: host-side fill metadata (safe inside capture) plus the
+        # seq_lens the kernel will walk against (skipped inside capture).
+        from vllm_hcu.v1.attention.backends.mla import vmfprobe as _vp
+        _vp.mark(
+            "flash_build_nc_decode",
+            rows=rows, demand_cols=demand_cols, pool_pages=pool_pages,
+            n_tile=n, m_split=m, num_decodes=num_decodes,
+            query_len=query_len, pages_per_block=_pages_per_block,
+            stamped=stamp.get((num_decodes, query_len)),
+            cap=_vp.capturing(),
+            src_vmf=_vp.file_sha(__file__),
+        )
+        _vp.audit_seq_lens(
+            "flash_build_nc_decode", seq_lens_device[:num_decodes],
+            dict(router="nc_dense", max_seq_len=max_seq_len),
         )
         scheduler_metadata.tile_scheduler_metadata = tile_view
         scheduler_metadata.num_splits = ns_view
@@ -649,6 +682,23 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
             scheduler_metadata.num_splits = num_splits
 
         if self.kv_cache_dtype.startswith("fp8"):
+            # VMFPROBE: RAW manager-block table audit of the stock dense
+            # causal launch — no clamp guards this path; out-of-pool null
+            # ids (historically 6551 vs 3233) reaching the fp8 kernel are
+            # the primary bs64 suspect. No-op inside capture.
+            from vllm_hcu.v1.attention.backends.mla import vmfprobe as _vp
+            _vp.audit_table(
+                "flash_dense_ca_launch",
+                attn_metadata.decode.block_table,
+                kv_c_and_k_pe_cache.shape[0], num_decodes,
+                dict(phase="raw", router="dense_ca",
+                     cache_blocks=kv_c_and_k_pe_cache.shape[0],
+                     src_vmf=_vp.file_sha(__file__)),
+            )
+            _vp.audit_seq_lens(
+                "flash_dense_ca_launch", attn_metadata.decode.seq_lens,
+                dict(router="dense_ca"),
+            )
             o, lse = flash_mla_with_kvcache_fp8(
                 q=q,
                 k_cache=kv_c_and_k_pe_cache.unsqueeze(-2),  # Add head dim of 1
@@ -704,8 +754,32 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
         # uncompressed storage layout, while k_cache.shape[0] is the actual
         # number of kernel pages the launch will index.  Clamp our own
         # expanded table to it before the kernel sees it.
+        # VMFPROBE: pre/post-clamp audits of the expanded table the NC
+        # launch will dereference directly.
+        from vllm_hcu.v1.attention.backends.mla import vmfprobe as _vp
+        _vp.audit_table(
+            "flash_nc_launch",
+            decode.block_table[:num_decodes],
+            k_cache.shape[0], num_decodes,
+            dict(phase="raw", router="nc_dense", qlen=query_len,
+                 cache_pages=k_cache.shape[0], block_page=blocks,
+                 src_vmf=_vp.file_sha(__file__)),
+        )
         decode.block_table[:num_decodes].clamp_(
             min=0, max=k_cache.shape[0] - 1
+        )
+        _vp.audit_table(
+            "flash_nc_launch",
+            decode.block_table[:num_decodes],
+            k_cache.shape[0], num_decodes,
+            dict(phase="post", router="nc_dense", qlen=query_len),
+        )
+        _vp.mark(
+            "flash_nc_launch", qlen=query_len, rows=num_decodes,
+            cache_pages=k_cache.shape[0],
+            tile_rows=int(decode.scheduler_metadata.tile_scheduler_metadata.shape[0]),
+            ns_rows=int(decode.scheduler_metadata.num_splits.shape[0]),
+            cap=_vp.capturing(),
         )
         if k_cache.dtype != _FP8_E4M3:
             k_cache = k_cache.view(_FP8_E4M3)

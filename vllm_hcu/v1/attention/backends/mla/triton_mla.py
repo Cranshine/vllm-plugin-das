@@ -393,9 +393,32 @@ class HcuTritonMLAMetadataBuilder(TritonMLAMetadataBuilder):
             block_table_tensor[:, :walk_cols].unsqueeze(-1) * subpage
         )
         bt3[:, :walk_cols].add_(self._hcu_bt_sub_arange)
+        # VMFPROBE (vmfaultfix branch): raw expanded-id audit between the
+        # expansion and the clamp. No-op inside capture.
+        from vllm_hcu.v1.attention.backends.mla import vmfprobe as _vp
+        audit_extra = dict(
+            phase="raw",
+            num_decodes=num_decodes,
+            query_len=query_len,
+            demand_cols=demand_cols,
+            stamp_rows=stamp[shape_key],
+            tile_rows=n,
+            pool_pages=pool_pages,
+            src_vmf=_vp.file_sha(__file__),
+        )
+        _vp.audit_table(
+            "triton_fill_flash_sched",
+            bt3[:, :walk_cols].reshape(rows, -1),
+            pool_pages, rows, audit_extra,
+        )
         # Unconditional both-bounds clamp (min=0 keeps a corrupted id from
         # tipping below the pool base; the kernel dereferences ids directly).
         bt3[:, :walk_cols].clamp_(min=0, max=pool_pages - 1)
+        _vp.audit_table(
+            "triton_fill_flash_sched",
+            bt3[:, :walk_cols].reshape(rows, -1),
+            pool_pages, rows, dict(audit_extra, phase="post"),
+        )
         # Views of the persistent buffers keep their data_ptr across steps;
         # the captured kernel binds these addresses at capture time.
         tile_view = self._hcu_sched_buf[:n]
@@ -562,10 +585,30 @@ class HcuTritonMLAImpl(TritonMLAImpl):
             # Same pool clip as the builder path: padded table cells past
             # a short request's allocation carry out-of-pool null ids;
             # both bounds, matching the builder's fill clamp.
+            from vllm_hcu.v1.attention.backends.mla import vmfprobe as _vp
             pool_cap = (
                 kv_c_and_k_pe_cache.shape[0] * subpage - 1
             )
+            _vp.audit_table(
+                "triton_nc_eager",
+                bt3v.reshape(bt3v.shape[0], -1),
+                pool_cap + 1, bt_stock.shape[0],
+                dict(phase="raw", num_decodes=num_decodes, query_len=query_len,
+                     src_cols=src_cols, eager=True,
+                     src_vmf=_vp.file_sha(__file__)),
+            )
             bt3v.clamp_(min=0, max=pool_cap)
+            _vp.audit_table(
+                "triton_nc_eager",
+                bt3v.reshape(bt3v.shape[0], -1),
+                pool_cap + 1, bt_stock.shape[0],
+                dict(phase="post", num_decodes=num_decodes, query_len=query_len,
+                     eager=True),
+            )
+            _vp.audit_seq_lens(
+                "triton_nc_eager", seq_lens[:num_decodes],
+                dict(eager=True, pages_needed=pages_needed),
+            )
 
         # Kernel contract: [pages, page_tokens, 1, D] (kv head axis at -2)
         # over 64-token kernel pages. A stored-view cache reshapes without
@@ -584,6 +627,20 @@ class HcuTritonMLAImpl(TritonMLAImpl):
             (q_spec.to(torch.float32) / layer._q_scale.to(torch.float32))
             .clamp(-448.0, 448.0)
             .to(_FP8_E4M3)
+        )
+        # VMFPROBE: launch-geometry breadcrumb (host-only, capture-safe).
+        from vllm_hcu.v1.attention.backends.mla import vmfprobe as _vp
+        _vp.mark(
+            "triton_nc_launch",
+            qlen=query_len, heads=q_heads, rows=num_decodes,
+            cache_pages=k_cache.shape[0],
+            tile_rows=int(tile.shape[0]), ns_rows=int(nsplits.shape[0]),
+            sched_had=(sched is not None), cap=capturing(),
+            src_vmf=_vp.file_sha(__file__),
+        )
+        _vp.audit_seq_lens(
+            "triton_nc_launch", seq_lens[:num_decodes],
+            dict(router="nc_flash", qlen=query_len),
         )
         o, lse = flash_mla_with_kvcache_fp8(
             q=q_fp8,
