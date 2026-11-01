@@ -263,15 +263,38 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
         num_decode_tokens: int,
         dcp_tot_seq_lens_device: torch.Tensor | None,
     ) -> FlashMLADecodeMetadata:
-        # TASK2: non-causal DSpark draft groups flatten to request-major
-        # decode rows with a uniform query_len>1. The vendor fp8 kernel
-        # walks 64-token pages, so the manager block table is expanded
-        # into a registry-persistent buffer (FIX13 contract: rebuilds
-        # rebind the SAME storage; captured graphs keep stable
-        # addresses) with an unconditional in-pool clamp.
+        # VMFPROBE (vmfaultfix branch): the manager block table that a FULL
+        # cudagraph bakes in for replay is only writable HERE (eager builder,
+        # runs every step). The R33-E crash family (bf16 flash_fwd_kernel_
+        # gfx938 queue heads, fault VA = draft k_cache slab +0x207000) must
+        # be caught at this write point — inside forward/replay probes never
+        # execute (R33-E: fa_varlen/bf16_dense both 0 hits). Audit the raw
+        # manager ids against the draft pool size every step. No-op inside
+        # capture; VLLM_HCU_VMFPROBE=0 disables.
+        from vllm_hcu.v1.attention.backends.mla import vmfprobe as _vp
+        _spec = getattr(self, "kv_cache_spec", None)
+        _pages = getattr(_spec, "num_blocks", None)
+        _vp.audit_table(
+            "bf16_dense_build"
+            if not self.is_fp8_kvcache
+            else "dense_build",
+            block_table_tensor,
+            _pages if _pages else 0b1111111111 << 20,  # sentinel: audit needs bound
+            seq_lens_device.shape[0]
+            if seq_lens_device is not None else 0,
+            dict(phase="raw", router="builder",
+                 pool_pages=_pages,
+                 max_seq_len=max_seq_len,
+                 src_vmf=_vp.file_sha(__file__)),
+        )
         if getattr(self, "_nc_ready", False) and (
             self.non_causal_multi_token_decode
         ):
+            # decode rows with a uniform query_len>1. The vendor fp8 kernel
+            # walks 64-token pages, so the manager block table is expanded
+            # into a registry-persistent buffer (FIX13 contract: rebuilds
+            # rebind the SAME storage; captured graphs keep stable
+            # addresses) with an unconditional in-pool clamp.
             return self._build_nc_decode(
                 block_table_tensor,
                 seq_lens_device,
