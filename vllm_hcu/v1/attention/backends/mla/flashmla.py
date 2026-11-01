@@ -452,6 +452,27 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
             raise RuntimeError(
                 f"nc walk window {demand_cols} exceeds table width {cols}"
             )
+        # VMFPROBE guard (vmfaultfix branch, expert R9 P0-1): the kernel
+        # walks rows*demand_cols expanded 64-token pages. bs64 hc64
+        # VMFaults walked past their tensor's 2MiB segment tail within
+        # 0-3 pages, 6/6 rounds, while every value audit showed in-bounds
+        # — assert the walk stays inside the buffer BEFORE the launch.
+        # Host-int only; capture-safe.
+        from vllm_hcu.v1.attention.backends.mla import vmfprobe as _vp
+        _vp.mark(
+            "nc_walk_guard",
+            rows=rows, demand_cols=demand_cols, subpage=subpage,
+            walk_rows=rows * demand_cols,
+            bt_capacity=(self._nc_bt_buf.shape[0] * self._nc_bt_cols),
+            bt_bytes=self._nc_bt_buf.numel()
+            * self._nc_bt_buf.element_size(),
+        )
+        if rows * demand_cols > self._nc_bt_buf.shape[0] * self._nc_bt_cols:
+            raise RuntimeError(
+                f"nc walk guard: rows*demand_cols {rows}*{demand_cols}="
+                f"{rows * demand_cols} exceeds buffer capacity "
+                f"{self._nc_bt_buf.shape[0]}x{self._nc_bt_cols}"
+            )
 
         num_q_tokens_per_head_k = query_len * self.num_q_heads
         scheduler_metadata, _ = get_mla_metadata(
