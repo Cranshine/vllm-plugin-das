@@ -1085,6 +1085,34 @@ class FlashAttentionImpl(AttentionImpl):
             # to the metadata builders (bf16_dense_build / fa builder) —
             # forward() only executes at capture/warmup, replay never runs
             # python, so probes here could never observe serve-time values.
+            from vllm_hcu.v1.attention.backends.mla import vmfprobe as _vp
+            _fa_spec = getattr(self, "kv_cache_spec", None)
+            _fa_pages = getattr(_fa_spec, "num_blocks", None) if _fa_spec else getattr(
+                getattr(self, "_current_kv_cache_spec", None), "num_blocks", None
+            )
+            if _fa_pages:
+                _vp.audit_table(
+                    "fa_build",
+                    common_attn_metadata.block_table_tensor,
+                    _fa_pages,
+                    num_reqs,
+                    dict(
+                        phase="raw",
+                        router="fa_builder",
+                        pool_pages=_fa_pages,
+                        max_seq_len=max_seq_len,
+                        src_vmf=_vp.file_sha(__file__),
+                    ),
+                )
+            else:
+                _vp.mark(
+                    "fa_build_unknown_pool",
+                    extra=dict(
+                        max_seq_len=max_seq_len,
+                        num_reqs=num_reqs,
+                        builder_cls=type(self).__name__,
+                    ),
+                )
             cu_seqlens_q = attn_metadata.query_start_loc
             seqused_k = attn_metadata.seq_lens
             max_seqlen_q = attn_metadata.max_query_len

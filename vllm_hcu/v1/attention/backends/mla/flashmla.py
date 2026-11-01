@@ -287,6 +287,16 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
                  max_seq_len=max_seq_len,
                  src_vmf=_vp.file_sha(__file__)),
         )
+        _vp.mark(
+            "bf16_dense_build" if not self.is_fp8_kvcache else "dense_build",
+            extra=dict(
+                builder_cls=type(self).__name__,
+                backend_name=self.__class__.__module__.split(".")[-1],
+                kc_pages=_pages,
+                max_seq_len=max_seq_len,
+                pid_is=getattr(_spec, "page_size", None),
+            ),
+        )
         if getattr(self, "_nc_ready", False) and (
             self.non_causal_multi_token_decode
         ):
