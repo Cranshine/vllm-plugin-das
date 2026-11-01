@@ -1081,6 +1081,26 @@ class FlashAttentionImpl(AttentionImpl):
             value_cache = value_cache.view(dtype)
 
         if not attn_metadata.use_cascade:
+            # VMFPROBE (vmfaultfix branch): the paged K/V path here —
+            # including the NON-quantized bf16 flash_attn_varlen that the
+            # DSpark draft MLA window rides — consumes block_table with NO
+            # audit and NO clamp. nmz22 R33-D queue-head conviction:
+            # flash_fwd_kernel_gfx938 faulted at k_cache-slab +0x207000
+            # (next 2MiB slab, +0x7000 into unmapped VA). Audit the raw
+            # table against the paged cache block count. No-op inside
+            # capture; VLLM_HCU_VMFPROBE=0 disables.
+            from vllm_hcu.v1.attention.backends.mla import vmfprobe as _vp
+            _vp.audit_table(
+                "fa_varlen_bf16"
+                if not is_quantized_kv_cache(self.kv_cache_dtype)
+                else "fa_varlen_fp8",
+                block_table,
+                key_cache.shape[0], num_actual_tokens,
+                dict(phase="raw", max_seqlen_k=int(max_seqlen_k),
+                     causal=attn_metadata.causal,
+                     mode=_get_flash_attn_mode(),
+                     src_vmf=_vp.file_sha(__file__)),
+            )
             cu_seqlens_q = attn_metadata.query_start_loc
             seqused_k = attn_metadata.seq_lens
             max_seqlen_q = attn_metadata.max_query_len
