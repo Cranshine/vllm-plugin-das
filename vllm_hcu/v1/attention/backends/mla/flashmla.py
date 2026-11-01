@@ -295,6 +295,9 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
                 kc_pages=_pages,
                 max_seq_len=max_seq_len,
                 pid_is=getattr(_spec, "page_size", None),
+                block_size=getattr(_spec, "block_size", None),
+                kv_quant_mode=getattr(_spec, "kv_quant_mode", None),
+                dtype=str(getattr(_spec, "dtype", None)),
             ),
         )
         if getattr(self, "_nc_ready", False) and (
@@ -746,13 +749,40 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
                 kv_cache_dtype=self.kv_cache_dtype,
             )
         else:
-            # VMFPROBE (vmfaultfix branch): the DSpark draft runs this bf16
-            # dense branch with the RAW manager block table — no _fill_nc_bt
-            # expansion/clamp, no prior audit. Out-of-pool sentinel padding
-            # ids reaching the bf16 kernel are now the prime bs64 suspect
-            # (queue-head conviction: flash_fwd_kernel_gfx938 bf16). No-op
-            # inside capture.
+            # VMFPROBE (vmfaultfix branch): R33-H k_cache TENSOR ARCHIVE
+            # (expert round 3, experiment c): the draft bf16 kv-cache's
+            # true geometry is the missing denominator all 5 crash rounds
+            # share. forward() runs at CAPTURE time (replay never executes
+            # python), so print the archive exactly once per layer here —
+            # host-only static attributes, capture-safe via mark(), no
+            # sync, no tensor reads.
             from vllm_hcu.v1.attention.backends.mla import vmfprobe as _vp
+            if not getattr(self, "_vmf_kc_archived", False):
+                self._vmf_kc_archived = True
+                try:
+                    _st = kv_c_and_k_pe_cache.untyped_storage()
+                    _vp.mark(
+                        "bf16_kc_archive",
+                        extra=dict(
+                            layer=getattr(layer, "layer_name", None)
+                            or type(layer).__name__,
+                            shape=list(kv_c_and_k_pe_cache.shape),
+                            pages=int(kv_c_and_k_pe_cache.shape[0]),
+                            data_ptr=kv_c_and_k_pe_cache.data_ptr(),
+                            storage_ptr=_st.data_ptr(),
+                            storage_bytes=_st.nbytes(),
+                            is_view=(
+                                kv_c_and_k_pe_cache.data_ptr()
+                                != _st.data_ptr()
+                            ),
+                            bt_shape=list(
+                                attn_metadata.decode.block_table.shape
+                            ),
+                            cap=_vp.capturing(),
+                        ),
+                    )
+                except Exception:
+                    pass
             _vp.audit_table(
                 "flash_bf16_dense_launch",
                 attn_metadata.decode.block_table,
