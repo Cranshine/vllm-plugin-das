@@ -713,6 +713,27 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
                 kv_cache_dtype=self.kv_cache_dtype,
             )
         else:
+            # VMFPROBE (vmfaultfix branch): the DSpark draft runs this bf16
+            # dense branch with the RAW manager block table — no _fill_nc_bt
+            # expansion/clamp, no prior audit. Out-of-pool sentinel padding
+            # ids reaching the bf16 kernel are now the prime bs64 suspect
+            # (queue-head conviction: flash_fwd_kernel_gfx938 bf16). No-op
+            # inside capture.
+            from vllm_hcu.v1.attention.backends.mla import vmfprobe as _vp
+            _vp.audit_table(
+                "flash_bf16_dense_launch",
+                attn_metadata.decode.block_table,
+                kv_c_and_k_pe_cache.shape[0], num_decodes,
+                dict(phase="raw", router="bf16_dense",
+                     cache_blocks=kv_c_and_k_pe_cache.shape[0],
+                     query_len=attn_metadata.num_decode_tokens // max(num_decodes, 1),
+                     causal=attn_metadata.causal,
+                     src_vmf=_vp.file_sha(__file__)),
+            )
+            _vp.audit_seq_lens(
+                "flash_bf16_dense_launch", attn_metadata.decode.seq_lens,
+                dict(router="bf16_dense"),
+            )
             o, lse = flash_mla_with_kvcache(
                 q=q,
                 k_cache=kv_c_and_k_pe_cache.unsqueeze(-2),  # Add head dim of 1
