@@ -243,6 +243,10 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_ple_prefetch")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_ple_cudagraph")),
     _CallbackSpec(_adapter("core_fix", "patch_rocm_mla_sparse_metadata")),
+    # R36: shrink the dist FA funnel max_seqlen_q when packed rows cannot
+    # reach it, re-arming the flash-attention-das epilogue row guard
+    # (fwd_launch_template.h:153 / fwd_epilogue_gfx938.h:39-45).
+    _CallbackSpec(_adapter("core_fix", "patch_flash_attn_vmf_guard")),
 )
 
 
