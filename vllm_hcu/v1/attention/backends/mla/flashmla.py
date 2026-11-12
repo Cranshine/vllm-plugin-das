@@ -589,10 +589,11 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
         # wrong for this full-causal draft. Split the fused tensor back into
         # its bf16 components and run the causal CAT fp8 kernel, which
         # quantizes q in-kernel (descale_q) and reads the fp8 KV with the
-        # layer's descale_k. Env-gated; default off keeps stock behavior.
+        # layer's descale_k. Pure shape/dtype guard: only the draft's
+        # single-tensor bf16 q over an fp8 cache matches; every other
+        # caller (tuple CAT, pre-quantized fp8 q, bf16 KV) falls through.
         if (
-            henvs.VLLM_HCU_K3_DSPARK_DRAFT_CAT_FP8
-            and isinstance(q, torch.Tensor)
+            isinstance(q, torch.Tensor)
             and q.dtype == torch.bfloat16
             and self.kv_cache_dtype == "fp8_e4m3"
         ):
