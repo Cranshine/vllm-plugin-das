@@ -454,6 +454,7 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("framework_opt", "patch_step5_moe_combine")),
     _CallbackSpec(_adapter("framework_opt", "patch_step5_token_fp8")),
     _CallbackSpec(_adapter("framework_opt", "patch_step5_skinny_lm_head")),
+    _CallbackSpec(_adapter("framework_opt", "patch_kimik31_skinny_lm_head")),
     _CallbackSpec(_adapter("framework_opt", "patch_step5_eplb_communicator")),
     _CallbackSpec(_adapter("framework_opt", "patch_step5_eplb_transfer")),
     _CallbackSpec(_adapter("framework_opt", "patch_step5_eplb_async_worker")),
