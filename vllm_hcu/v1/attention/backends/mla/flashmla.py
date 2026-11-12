@@ -582,6 +582,48 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
                     num_decodes, query_len,
                 )
 
+        # DSpark draft CAT fp8 (causal): the K3 draft's upstream
+        # _decode_concat_cache hands FlashMLA a single bf16 [B*L, H, 576]
+        # tensor ([ql_nope 512 | q_pe 64]) over an fp8 cache -- the generic
+        # fp8 branch below rejects bf16, and the NC path is semantically
+        # wrong for this full-causal draft. Split the fused tensor back into
+        # its bf16 components and run the causal CAT fp8 kernel, which
+        # quantizes q in-kernel (descale_q) and reads the fp8 KV with the
+        # layer's descale_k. Env-gated; default off keeps stock behavior.
+        if (
+            henvs.VLLM_HCU_K3_DSPARK_DRAFT_CAT_FP8
+            and isinstance(q, torch.Tensor)
+            and q.dtype == torch.bfloat16
+            and self.kv_cache_dtype == "fp8_e4m3"
+        ):
+            num_decodes = attn_metadata.num_decodes
+            q_nope, q_pe = q.split(
+                [self.kv_lora_rank, q.shape[-1] - self.kv_lora_rank], dim=-1
+            )
+            q_nope = reshape_query_for_spec_decode(q_nope, num_decodes)
+            q_pe = reshape_query_for_spec_decode(q_pe, num_decodes)
+            scheduler_metadata = attn_metadata.decode.scheduler_metadata
+            o, lse = flash_mla_with_kvcache_fp8_with_cat(
+                q_nope=q_nope,
+                q_pe=q_pe,
+                k_cache=kv_c_and_k_pe_cache.unsqueeze(-2).view(
+                    torch.float8_e4m3fn
+                ),
+                block_table=attn_metadata.decode.block_table,
+                cache_seqlens=attn_metadata.decode.seq_lens,
+                head_dim_v=self.kv_lora_rank,
+                tile_scheduler_metadata=(
+                    scheduler_metadata.tile_scheduler_metadata
+                ),
+                num_splits=scheduler_metadata.num_splits,
+                softmax_scale=self.scale,
+                causal=True,
+                descale_q=layer._q_scale.reshape(1),
+                descale_k=layer._k_scale.reshape(1),
+            )
+            o = reshape_attn_output_for_spec_decode(o)
+            return o, lse
+
         # if type(q) is tuple:
         #     q = torch.cat(q, dim=-1)
         
