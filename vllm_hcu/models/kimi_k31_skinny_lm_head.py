@@ -28,27 +28,36 @@ native projection):
   program, so fusing tiles cuts the repeated ``x`` traffic; NT of 64x64 fp32
   accumulators is what the VGPR budget allows.
 * ``BK=128`` for the small tile and for TP2's wide tile; the wide tile doubles
-  the ``x`` staging in LDS so TP4 is faster with ``BK=64``.  Other BK loses
-  15-70%.
+  the ``x`` staging in LDS so TP4/TP8/TP1 are faster with ``BK=64``.  Other BK
+  loses 15-70%.
 * ``num_stages=1`` on purpose: a second pipeline stage needs 80-160 KiB of LDS
   against the 64 KiB per-workgroup budget (``OutOfResources``), and the stage
   that does fit is slower because it costs occupancy.
 * Per-width plan, because the best ``NT`` depends on the shard width and on how
   many programs remain: TP2 (N=81920) and TP8 (N=20480) want ``NT=2`` (640 and
   160 programs), TP4 (N=40960) and TP1 (N=163840) ``NT=4``.
-* Narrow shards keep the native projection where the stream is not ahead: at
-  N=20480 the stream wins 1.45-1.50x from M=32..64 and loses below M=8 and above
-  M=64, so ``min_m`` and the missing wide plan guard it.
+* Routing is the Kimi head shape itself (2026-11-12): the target text model's
+  ``LogitsProcessor`` is built from the ``text_config`` (model_type
+  ``kimi_linear``) while the DSpark draft's is built from the top-level config
+  (model_type ``kimi_k31``), so no config-derived marker can see both.  Both
+  share the same weight, so the per-rank width of the 163840 vocab plus
+  ``K == 7168`` is the single routing key.  Every decode M (1..128) routes to
+  this kernel: at N=20480 the native projection is faster below M=24 (0.19 vs
+  0.24 ms) and even at wide M=96 (0.349 vs 0.372 ms), but the uniform switch
+  was taken on purpose; only M > 128 (prefill logits) keeps the native path.
 
 Measured per call (nmz30, native = the projection vLLM runs today):
 
     M=48    TP2  N= 81920   4.95 ms -> 0.772 ms (6.4x, 1.52 TB/s, bit-exact)
             TP4  N= 40960   4.14 ms -> 0.435 ms (9.5x, 1.35 TB/s, bit-exact)
             TP8  N= 20480  0.363 ms -> 0.243 ms (1.50x, 1.21 TB/s)
-    M=96    TP2  N= 81920   4.87 ms -> 1.105 ms (4.4x, 1.06 TB/s, bit-exact)
+    M=96    TP1  N=163840   3.304 ms -> 2.255 ms (1.47x, 1.04 TB/s)
+            TP2  N= 81920   4.87 ms -> 1.105 ms (4.4x, 1.06 TB/s, bit-exact)
             TP4  N= 40960   7.96 ms -> 0.598 ms (13.3x, 0.98 TB/s, bit-exact)
+            TP8  N= 20480   0.349 ms -> 0.372 ms (0.94x, uniform switch)
     M=128   TP2  N= 81920   7.04 ms -> 1.108 ms (6.4x, bit-exact)
             TP4  N= 40960   9.06 ms -> 0.599 ms (15.1x, bit-exact)
+            TP8  N= 20480   0.414 ms -> 0.372 ms (1.11x)
 
 Where the result is not bit-identical it differs from the native projection only
 in fp32 accumulation order (max 2e-3 in head-logit units; both are 2.09e-3
@@ -56,8 +65,8 @@ relRMS away from an fp64 reference, i.e. the same bf16 GEMM, not a precision
 change).
 
 Disable through the process master switch ``VLLM_HCU_USE_CUSTOM_OPS=0``; the
-adapter only reaches this module for a ``kimi_k31`` model whose head is exactly
-unquantized bf16 with no embedding bias.
+adapter only reaches this module for a head that is exactly unquantized bf16
+with no embedding bias, K = 7168 and one of the Kimi vocab shard widths.
 """
 
 from __future__ import annotations
@@ -74,40 +83,41 @@ MAX_M = 128
 # Rows covered by a single tile in the small / wide plan.
 _BM_SMALL = 64
 _BM_WIDE = 128
-# Narrowest per-rank head shard the streaming kernel is ahead of the native
-# projection for (below this the launch has too few programs to fill the DCU).
-MIN_N = 16384
+# Routing key: the Kimi-K3.1-Pro head itself (hidden 7168, vocab 163840). The
+# per-rank widths of that vocab are the only N values with a tuned plan; every
+# other shape (a different K, a different vocab, a quantized or biased head)
+# keeps the native projection.
+_KIMI_K = 7168
 
 _BN = 64
-# (num_ntiles, num_warps, min_m) for the 64-row tile, per per-rank head width.
-# The K3.1-Pro INT4 checkpoint has vocab 163840, so TP1/TP2/TP4/TP8 give these.
-_PLANS_SMALL: dict[int, tuple[int, int, int]] = {
-    163840: (4, 4, 32),  # TP1
-    81920: (2, 4, 1),  # TP2
-    40960: (4, 4, 1),  # TP4
-    20480: (2, 4, 32),  # TP8, native is faster at M<=8
+# (num_ntiles, num_warps) for the 64-row tile, per per-rank head width.  The
+# K3.1-Pro INT4 checkpoint has vocab 163840, so TP1/TP2/TP4/TP8 give these.
+_PLANS_SMALL: dict[int, tuple[int, int]] = {
+    163840: (4, 4),  # TP1
+    81920: (2, 4),  # TP2
+    40960: (4, 4),  # TP4
+    20480: (2, 4),  # TP8
 }
-# Any other per-rank width (e.g. the 131072-vocab export at TP2/TP4) keeps the
-# conservative plan; it is only used from a few decode rows on.
-_DEFAULT_SMALL = (2, 4, 32)
 # (num_ntiles, num_warps, BK) for the 128-row tile (bs*6 > 64).  The wide tile
-# doubles the x staging, so TP2 keeps BK=128 while TP4 (more programs per tile)
-# is faster with BK=64.  TP8 has no wide plan on purpose: there the native
-# projection is already the faster one.
+# doubles the x staging, so TP2 keeps BK=128 while TP4/TP8/TP1 (more programs
+# per tile) are faster with BK=64.
 _PLANS_WIDE: dict[int, tuple[int, int, int]] = {
+    163840: (2, 8, 64),  # TP1: 2.255 ms vs 3.304 native at M=96
     81920: (4, 8, 128),  # TP2
     40960: (4, 8, 64),  # TP4
+    20480: (2, 8, 64),  # TP8: 0.372 ms vs 0.349 native at M=96 (0.94x), 1.11x at M=128
 }
 _BK_SMALL = 128
 
 
 def _plan(n: int, m: int) -> tuple[int, int, int, int] | None:
     """(BM, BK, NT, num_warps) for a per-rank head width N at M rows, or None."""
-    if n < MIN_N:
-        return None
     if m <= _BM_SMALL:
-        nt, warps, min_m = _PLANS_SMALL.get(n, _DEFAULT_SMALL)
-        if m < min_m or n % (_BN * nt) != 0:
+        small = _PLANS_SMALL.get(n)
+        if small is None:
+            return None
+        nt, warps = small
+        if n % (_BN * nt) != 0:
             return None
         return _BM_SMALL, _BK_SMALL, nt, warps
     if m > _BM_WIDE:
@@ -168,7 +178,7 @@ def enabled() -> bool:
 
 
 def usable(x: torch.Tensor, weight: torch.Tensor) -> bool:
-    """Shape/layout gate for the K3.1-Pro streaming GEMM."""
+    """Shape/layout gate: the Kimi-K3.1-Pro head at decode M."""
     if not enabled() or not x.is_cuda or x.dim() < 2:
         return False
     if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
@@ -176,7 +186,7 @@ def usable(x: torch.Tensor, weight: torch.Tensor) -> bool:
     if weight.dim() != 2 or not weight.is_contiguous():
         return False
     n, k = weight.shape
-    if k != x.shape[-1] or k % 64 != 0:
+    if k != _KIMI_K or k != x.shape[-1]:
         return False
     m = x.numel() // k
     return 0 < m <= MAX_M and _plan(n, m) is not None
@@ -209,4 +219,4 @@ def linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return out.reshape(*x.shape[:-1], n)
 
 
-__all__ = ["MAX_M", "MIN_N", "enabled", "linear", "usable"]
+__all__ = ["MAX_M", "enabled", "linear", "usable"]

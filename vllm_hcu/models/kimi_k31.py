@@ -84,13 +84,6 @@ def _dsa_config(text_config: Any) -> SimpleNamespace | None:
     return raw
 
 
-def kimi_k31_is_k31(model_config: Any, hf_config: Any) -> bool:
-    hf_config = hf_config if hf_config is not None else getattr(
-        model_config, "hf_config", None
-    )
-    return getattr(hf_config, "model_type", None) == "kimi_k31"
-
-
 def kimi_k31_dsa_layers(text_config: Any) -> frozenset[int] | None:
     """0-based decoder layer indices owning a DSA indexer, or None."""
     dsa = _dsa_config(text_config)
