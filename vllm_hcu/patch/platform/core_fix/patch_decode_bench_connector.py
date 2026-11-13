@@ -353,29 +353,6 @@ def _mamba_page_pattern(shapes, dtypes, width, fill_mean, fill_std, device):
     return entry
 
 
-def _raise_for_mode(mode: str) -> None:
-    if mode == _GROUP_MODE_PACKED:
-        raise PatchCompatibilityError(
-            "DecodeBenchConnector cannot fill packed FP8 KV group layouts "
-            "(e.g. per-token-head scales / nvfp4) with one byte value: the "
-            "storage mixes quantized values, scales, and/or BF16 RoPE, or "
-            "packs heterogeneous layers. Configure a scalar FP8 cache or fill "
-            "explicitly."
-        )
-    if mode == _GROUP_MODE_MIXED:
-        raise PatchCompatibilityError(
-            "DecodeBenchConnector refuses a mixed KV cache group: scalar-FP8 "
-            "layers combined with float/non-quantised layers cannot share one "
-            "synthetic fill without either truncating the byte layers or "
-            "changing the float layers; configure a uniform cache dtype."
-        )
-    raise PatchCompatibilityError(
-        "DecodeBenchConnector byte cache with unrecognised KV cache layout: "
-        "cannot decide FP8 encoding; refusing ambiguous fill (add the layout "
-        "to platform.core.decode_bench_fp8_fill explicitly if needed)."
-    )
-
-
 def _apply(module: ModuleType) -> bool:
     import torch
 
@@ -479,11 +456,24 @@ def _apply(module: ModuleType) -> bool:
     def _fill_blocks(self, group_idx, block_ids, num_tokens):
         modes = getattr(self, _GROUP_MODES_ATTR, {})
         mode = modes.get(group_idx, _GROUP_MODE_UNKNOWN)
-        if mode in (_GROUP_MODE_PACKED, _GROUP_MODE_MIXED):
-            # Refuse BEFORE upstream touches any layer in this group so the
-            # refusal guarantees zero writes for byte, float and state caches
-            # alike, regardless of layer iteration order.
-            _raise_for_mode(mode)
+        if mode == _GROUP_MODE_PACKED:
+            # No explicit byte encoding exists for packed layouts; the serve
+            # must never die on this bench-only fill path, so degrade loudly:
+            # upstream per-layer fill (packed byte layers read as zeros)
+            # instead of a fatal refusal.
+            _LOG.warning(
+                "[decode-bench-fp8-fill] group %d has packed FP8 flavour(s) "
+                "with no explicit byte encoding; falling back to the upstream "
+                "fill (packed byte layers will read as zeros) instead of "
+                "refusing, so the serve keeps running.",
+                group_idx,
+            )
+        # MIXED groups (scalar-FP8/DS-MLA byte layers + float layers in one
+        # group) are filled per layer: upstream iterates the group's layers
+        # individually, so each layer's tensor gets its own encoding in
+        # _fill_block_tensor -- float storage via upstream, byte storage via
+        # the e4m3fn / 656-byte patterns (K3.1: MLA fp8 + KDA float layers
+        # share a group).
         previous = getattr(self, _CURRENT_MODE_ATTR, None)
         previous_group = getattr(self, _CURRENT_GROUP_ATTR, None)
         setattr(self, _CURRENT_MODE_ATTR, mode)
@@ -509,12 +499,29 @@ def _apply(module: ModuleType) -> bool:
             group_idx = getattr(self, _CURRENT_GROUP_ATTR, -1)
             spec = getattr(self, _MAMBA_SPECS_ATTR, {}).get(group_idx)
             if spec is None:
-                _raise_for_mode(_GROUP_MODE_UNKNOWN)
+                # Never fatal on the bench-only fill path: degrade to the
+                # upstream fill with a warning.
+                _LOG.warning(
+                    "[decode-bench-fp8-fill] mamba group %d lost its state "
+                    "spec; falling back to upstream fill",
+                    group_idx,
+                )
+                return original_fill_block(self, kv_cache, block_ids, fill_mean, fill_std)
             shapes, dtypes = spec
-            entry = _mamba_page_pattern(
-                shapes, dtypes, int(kv_cache.shape[-1]),
-                fill_mean, fill_std, kv_cache.device,
-            )
+            try:
+                entry = _mamba_page_pattern(
+                    shapes, dtypes, int(kv_cache.shape[-1]),
+                    fill_mean, fill_std, kv_cache.device,
+                )
+            except PatchCompatibilityError as exc:
+                # Never fatal on the bench-only fill path (e.g. state spec
+                # larger than the page): degrade to upstream semantics.
+                _LOG.warning(
+                    "[decode-bench-fp8-fill] mamba state pattern unavailable "
+                    "(%s); falling back to upstream fill",
+                    exc,
+                )
+                return original_fill_block(self, kv_cache, block_ids, fill_mean, fill_std)
             block_ids_tensor = torch.tensor(
                 block_ids, dtype=torch.long, device=kv_cache.device
             )
@@ -525,18 +532,14 @@ def _apply(module: ModuleType) -> bool:
                 return None
             kv_cache[valid_block_ids] = _encode_like(entry, kv_cache.dtype)
             return None
-        if mode == _GROUP_MODE_DS_MLA:
-            if kv_cache.shape[-1] != _DS_MLA_WIDTH:
-                _LOG.info(
-                    "[decode-bench-kvdbg] ds_mla group reached a tensor with "
-                    "unexpected entry width: shape=%s dtype=%s -> falling "
-                    "back to upstream fill (layout support pending)",
-                    tuple(kv_cache.shape),
-                    kv_cache.dtype,
-                )
-                return original_fill_block(
-                    self, kv_cache, block_ids, fill_mean, fill_std
-                )
+        if kv_cache.shape[-1] == _DS_MLA_WIDTH and mode in (
+            _GROUP_MODE_DS_MLA,
+            _GROUP_MODE_MIXED,
+        ):
+            # A 656-byte-wide byte tensor is the ds_mla entry layout whatever
+            # else shares its group (MLA fp8 layer inside a mixed MLA+KDA
+            # group); fill it with the block-scaled pattern. Non-656 byte
+            # tensors in a mixed group are scalar-FP8 storage, handled below.
             entry = _ds_mla_pattern(fill_mean, fill_std, kv_cache.device)
             block_ids_tensor = torch.tensor(
                 block_ids, dtype=torch.long, device=kv_cache.device
@@ -549,18 +552,22 @@ def _apply(module: ModuleType) -> bool:
             kv_cache[valid_block_ids] = _encode_like(entry, kv_cache.dtype)
             return None
         if mode != _GROUP_MODE_PLAIN:
-            if mode in (_GROUP_MODE_PACKED, _GROUP_MODE_MIXED):
-                _raise_for_mode(mode)
-            # Unknown byte layouts keep upstream semantics (a warning marks the
-            # gap) instead of aborting a serve on a bench-only fill path.
-            _LOG.warning(
-                "[decode-bench-fp8-fill] unrecognised byte cache layout "
-                "(mode=%s shape=%s dtype=%s); falling back to upstream fill",
-                mode,
-                tuple(kv_cache.shape),
-                kv_cache.dtype,
-            )
-            return original_fill_block(self, kv_cache, block_ids, fill_mean, fill_std)
+            if mode in (_GROUP_MODE_PACKED, _GROUP_MODE_UNKNOWN):
+                # Packed/unknown byte layouts have no explicit encoding; the
+                # bench-only fill path must never abort the serve, so keep
+                # upstream semantics (a warning marks the gap: packed byte
+                # layers read as zeros).
+                _LOG.warning(
+                    "[decode-bench-fp8-fill] unrecognised/packed byte cache "
+                    "layout (mode=%s shape=%s dtype=%s); falling back to "
+                    "upstream fill",
+                    mode,
+                    tuple(kv_cache.shape),
+                    kv_cache.dtype,
+                )
+                return original_fill_block(self, kv_cache, block_ids, fill_mean, fill_std)
+            # MIXED byte tensors that are not 656-byte ds_mla entries are
+            # scalar-FP8 storage: encode the fill exactly like PLAIN.
 
         block_ids_tensor = torch.tensor(
             block_ids, dtype=torch.long, device=kv_cache.device
@@ -612,10 +619,14 @@ def _apply(module: ModuleType) -> bool:
     _LOG.info(
         "[decode-bench-fp8-fill] armed: e4m3fn byte encoding for groups whose "
         "layers are all scalar per-tensor FP8 (0.015 -> byte 0x08 / value "
-        "0.015625); fp8_ds_mla groups filled with the 656-byte block-scaled "
-        "layout (tile e4m3 values + unit fp32 scales + bf16 RoPE); other "
-        "mixed/packed groups refuse clearly; float, state and zero-fill paths "
-        "keep upstream semantics."
+        "0.015625); fp8_ds_mla storage filled with the 656-byte block-scaled "
+        "layout (tile e4m3 values + unit fp32 scales + bf16 RoPE); mixed "
+        "groups (scalar-FP8/DS-MLA byte layers + float layers, e.g. K3.1 "
+        "MLA+KDA) fill per layer: float storage via upstream, byte storage "
+        "via the encodings above; packed/unknown layouts fall back to the "
+        "upstream fill with a warning (packed bytes read as zeros); float, "
+        "state and zero-fill paths keep upstream semantics. Nothing on this "
+        "bench-only fill path aborts the serve."
     )
     return True
 

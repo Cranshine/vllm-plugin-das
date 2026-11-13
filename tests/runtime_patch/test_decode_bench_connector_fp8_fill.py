@@ -14,7 +14,9 @@ Exercises the REAL interface shapes and the REAL call chains:
   the block-indexed tensor branch and the list/tuple state branch, plus the
   circular-buffer zero-fill group;
 * scalar-FP8 byte caches get e4m3fn bytes (0.015 -> 0x08 / 0.015625), int8
-  negatives stay bit-exact, packed/mixed/unknown flavours refuse clearly;
+  negatives stay bit-exact; mixed groups (scalar-FP8/DS-MLA byte + float
+  layers) fill per layer; packed/unknown layouts degrade to the upstream
+  fill with a warning -- nothing on the fill path aborts the serve;
 * signature preservation, idempotent arming, non-contiguous views.
 """
 
@@ -199,29 +201,47 @@ def test_random_fill_deterministic_reference_real_chain():
 # ------------------------------------------------------------ packed guard ---
 
 
-def test_packed_uniform_group_refused():
+def test_ds_mla_narrow_byte_tensor_gets_plain_encoding():
+    """A ds_mla-flavoured group reaching a non-656-byte-wide byte tensor has
+    no block-scaled layout to encode; it degrades to the scalar-FP8 e4m3fn
+    encoding instead of aborting the serve."""
     connector, _ = _load_patched_connector()
     layers = ["l0"]
     groups = _groups_from([[_LayerSpec("fp8_ds_mla")]], [layers])
     cache = torch.zeros((2, 8), dtype=torch.uint8)
     w = _make_worker(connector, "fp8_ds_mla", groups, {"l0": cache})
-    with pytest.raises(Exception, match="packed FP8"):
-        w._fill_blocks(0, [0], 8)
-    assert cache.max().item() == 0  # nothing written
+    w._fill_blocks(0, [0], 8)  # no exception
+    assert cache.view(FN)[0].float()[0].item() == 0.015625
+    assert cache[1].sum().item() == 0  # unselected block untouched
 
 
-def test_packed_global_with_flavourless_layers_refused():
+def test_ds_mla_global_flavourless_narrow_byte_no_fatal():
     connector, _ = _load_patched_connector()
     layers = ["l0"]
     groups = _groups_from([[_LayerSpec()]], [layers])
     cache = torch.zeros((2, 8), dtype=torch.uint8)
     w = _make_worker(connector, "fp8_ds_mla", groups, {"l0": cache})
-    with pytest.raises(Exception):
-        w._fill_blocks(0, [0], 8)
+    w._fill_blocks(0, [0], 8)  # no exception
+    assert cache.view(FN)[0].float()[0].item() == 0.015625
+
+
+def test_packed_group_degrades_to_upstream_without_fatal():
+    """Packed flavours (nvfp4 / per-token-head scales) have no byte encoding;
+    the serve must survive: upstream fill (packed bytes read as zeros) plus
+    a warning -- never a fatal refusal on this bench-only path."""
+    connector, _ = _load_patched_connector()
+    layers = ["l0"]
+    groups = _groups_from([[_LayerSpec("nvfp4")]], [layers])
+    cache = torch.zeros((2, 8), dtype=torch.uint8)
+    w = _make_worker(connector, "auto", groups, {"l0": cache})
+    w._fill_blocks(0, [0], 8)  # no exception
+    # upstream uint8 fill of 0.015 truncates to zero bytes (documented gap)
     assert cache.max().item() == 0
 
 
-def test_uniform_group_packed_layer_in_scalargroup_refused_mixed():
+def test_uniform_group_packed_layer_in_scalargroup_fills_per_layer():
+    """[fp8_e4m3, fp8_ds_mla, fp8_e4m3] resolves to MIXED; per-layer fill:
+    byte tensors (non-656) get e4m3fn bytes, native-FP8 storage upstream."""
     connector, _ = _load_patched_connector()
     layers = ["l0", "l1", "l2"]
     groups = _groups_from(
@@ -232,10 +252,10 @@ def test_uniform_group_packed_layer_in_scalargroup_refused_mixed():
     native = torch.zeros((2, 4), dtype=FN)
     w = _make_worker(connector, "fp8_e4m3", groups,
                      {"l0": c0, "l1": c1, "l2": native})
-    with pytest.raises(Exception, match="packed FP8"):
-        w._fill_blocks(0, [0], 4)
-    assert c0.max().item() == 0 and c1.max().item() == 0
-    assert native.float().abs().sum().item() == 0
+    w._fill_blocks(0, [0], 4)
+    assert c0.view(FN)[0].float()[0].item() == 0.015625
+    assert c1.view(FN)[0].float()[1].item() == 0.015625
+    assert native[0].float()[0].item() == 0.015625
 
 
 def _snapshot(caches):
@@ -261,19 +281,19 @@ def _assert_unchanged(caches, clones):
 NON_BYTE_FIRST_CASES = [
     # (label, layer flavours in group order; a CASE with cache_kind list in
     #  the same order: byte | native | float | state)
-    ("native-first-packed",
-     ["fp8_e4m3", "fp8_ds_mla"],
+    ("native-first-mixed",
+     [None, "fp8_ds_mla"],
      ["native", "byte"]),
     ("float-first-mixed",
      [None, "fp8_e4m3"],
      ["float", "byte"]),
-    ("state-first-packed",
+    ("state-first-unknown",
      ["kimi_linear", "fp8_ds_mla"],
      ["state", "byte"]),
 ]
 
 BYTE_FIRST_CASES = [
-    ("byte-first-packed",
+    ("byte-first-mixed-dsmla",
      ["fp8_ds_mla", "fp8_e4m3"],
      ["byte", "native"]),
     ("byte-first-mixed",
@@ -282,15 +302,13 @@ BYTE_FIRST_CASES = [
 ]
 
 
-@pytest.mark.parametrize("label,flavours,kinds", NON_BYTE_CASES := NON_BYTE_FIRST_CASES)
-def test_group_refusal_zero_writes_when_non_byte_layers_come_first(
+@pytest.mark.parametrize("label,flavours,kinds", NON_BYTE_FIRST_CASES)
+def test_mixed_group_fills_per_layer_when_non_byte_layers_come_first(
         label, flavours, kinds):
-    """r12 WRITE-12-1: the early group refusal must guard EVERY layer order.
-
-    With native/float/state layers placed BEFORE the offending byte layer,
-    a naive implementation (no early refusal in the wrapper) writes those
-    layers first and only then raises; these snapshots catch that mutation.
-    """
+    """Mixed/unknown groups no longer abort the serve: upstream iterates the
+    group's layers individually, so every layer gets its own encoding --
+    float/native storage via upstream fill, scalar-FP8 byte storage via the
+    e4m3fn encoding. This mirrors the K3.1 MLA(fp8)+KDA(float) group."""
     connector, _ = _load_patched_connector()
     layers = [f"l{i}" for i in range(len(flavours))]
     groups = _groups_from(
@@ -307,21 +325,25 @@ def test_group_refusal_zero_writes_when_non_byte_layers_come_first(
             caches[name] = [torch.zeros((2, 4), dtype=torch.bfloat16)]
     w = _make_worker(
         connector,
-        "fp8_e4m3" if "packed" in label else "auto",
+        "fp8_e4m3",
         groups,
         caches,
     )
-    clones = _snapshot(caches)
-    with pytest.raises(
-        PatchCompatibilityError,
-        match="packed FP8" if "packed" in label else "mixed",
-    ):
-        w._fill_blocks(0, [0], 4)
-    _assert_unchanged(caches, clones)
+    w._fill_blocks(0, [0], 4)
+    # group UNKNOWN (unrecognised flavour) -> byte layers fall back to the
+    # upstream fill; uint8 storage of 0.015 truncates to zero bytes.
+    byte_expected = 0.015625 if "unknown" not in label else 0.0
+    for name, kind in zip(layers, kinds):
+        if kind == "byte":
+            assert caches[name].view(FN)[0].float()[0].item() == byte_expected, name
+        elif kind == "native":
+            assert caches[name][0].float()[0].item() == 0.015625, name
+        elif kind == "float":
+            assert abs(caches[name][0].float()[0].item() - 0.015) < 1e-6, name
 
 
 @pytest.mark.parametrize("label,flavours,kinds", BYTE_FIRST_CASES)
-def test_group_refusal_zero_writes_when_byte_layer_comes_first(
+def test_mixed_group_fills_per_layer_when_byte_layer_comes_first(
         label, flavours, kinds):
     connector, _ = _load_patched_connector()
     layers = [f"l{i}" for i in range(len(flavours))]
@@ -335,22 +357,22 @@ def test_group_refusal_zero_writes_when_byte_layer_comes_first(
             caches[name] = torch.zeros((2, 4), dtype=FN)
     w = _make_worker(
         connector,
-        "fp8_ds_mla" if "packed" in label else "auto",
+        "fp8_ds_mla" if "dsmla" in label else "auto",
         groups,
         caches,
     )
-    clones = _snapshot(caches)
-    with pytest.raises(
-        PatchCompatibilityError,
-        match="packed FP8" if "packed" in label else "mixed",
-    ):
-        w._fill_blocks(0, [0], 4)
-    _assert_unchanged(caches, clones)
+    w._fill_blocks(0, [0], 4)
+    for name, kind in zip(layers, kinds):
+        if kind == "byte":
+            assert caches[name].view(FN)[0].float()[0].item() == 0.015625, name
+        else:
+            assert caches[name][0].float()[0].item() == 0.015625, name
 
 
-def test_mixed_scalar_fp8_and_float_group_refused_zero_writes():
-    """scalar-FP8 + float layers in one group must NOT silently truncate the
-    byte layer (r11 P1): refuse the whole group with zero writes."""
+def test_mixed_scalar_fp8_and_float_group_fills_per_layer():
+    """scalar-FP8 + float layers in one group fill per layer: the byte layer
+    is NOT truncated to zeros (the legacy upstream behaviour this patch
+    guards against), the float layer keeps upstream semantics."""
     connector, _ = _load_patched_connector()
     layers = ["l_byte", "l_float"]
     groups = _groups_from(
@@ -359,20 +381,23 @@ def test_mixed_scalar_fp8_and_float_group_refused_zero_writes():
     float_cache = torch.zeros((2, 4), dtype=torch.float32)
     w = _make_worker(connector, "auto", groups,
                      {"l_byte": byte_cache, "l_float": float_cache})
-    with pytest.raises(PatchCompatibilityError, match="mixed"):
-        w._fill_blocks(0, [1], 4)
-    assert byte_cache.max().item() == 0
-    assert float_cache.abs().sum().item() == 0
+    w._fill_blocks(0, [1], 4)
+    assert byte_cache.view(FN)[1].float()[0].item() == 0.015625  # not zeros
+    assert abs(float_cache[1][0].item() - 0.015) < 1e-6
+    assert byte_cache[0].sum().item() == 0  # unselected block untouched
+    assert float_cache[0].abs().sum().item() == 0
 
 
-def test_unknown_flavour_refused_clearly():
+def test_unknown_flavour_falls_back_without_fatal():
+    """Unrecognised flavours keep the fallback-not-fatal behaviour: upstream
+    semantics plus a warning, never a serve abort on a bench-only path."""
     connector, _ = _load_patched_connector()
     layers = ["l0"]
     groups = _groups_from([[_LayerSpec("somefuture_fp9")]], [layers])
     cache = torch.zeros((2, 8), dtype=torch.uint8)
     w = _make_worker(connector, "fp8_e4m3", groups, {"l0": cache})
-    with pytest.raises(Exception, match="unrecognised"):
-        w._fill_blocks(0, [0], 8)
+    w._fill_blocks(0, [0], 8)  # no exception
+    # upstream uint8 fill of 0.015 truncates to zero bytes
     assert cache.max().item() == 0
 
 
