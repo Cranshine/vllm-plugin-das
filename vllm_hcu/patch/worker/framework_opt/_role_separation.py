@@ -12,10 +12,23 @@ ProtoSimple<2, 2, 4, 0, 0>, 4>``).
 This module owns an auxiliary "eager" TP all_reduce communicator used by
 the audited Kimi-K3 target and DSpark draft runtime adapters:
 
-  - the TP pynccl communicator keeps only captured-graph all_reduces
-    (the target decode graph and the DSpark draft graph);
+  - the TP pynccl communicator keeps only captured-graph collectives
+    (the target decode graph's and DSpark draft graph's all_reduces, and
+    -- via ``captured_ag_scope`` -- the DSpark draft graph's logits
+    all_gather);
   - the auxiliary communicator keeps only eager all_reduces
-    (prefill / profile / warmup forwards).
+    (prefill / profile / warmup forwards);
+  - the shared c10d device-group communicator keeps only eager
+    all_gathers (target LogitsProcessor + eager draft tails).
+
+``captured_ag_scope`` (v2 whole-graph draft capture) swaps the TP
+coordinator's ``_all_gather_out_place`` at INSTANCE level while a draft
+CUDA-graph capture is in progress, so the draft-logits all_gather is
+recorded on -- and replayed from -- the captured-role pynccl
+communicator instead of the shared c10d communicator. The shim
+reproduces the base-class concat all-gather layout bit-for-bit
+(ncclAllGather + reshape/movedim/reshape, the same semantics as the
+non-ROCm pynccl branch of ``cuda_communicator.all_gather``).
 
 The reroute is installed inside the audited model forwards only (see
 ``eager_ar_scope`` usage in ``patch_kimi_k3_eager_ar`` and
@@ -213,3 +226,96 @@ def eager_ar_scope() -> Iterator[None]:
             tp.__dict__.pop(_SWAP_ATTR, None)
         else:
             tp.__dict__[_SWAP_ATTR] = saved
+
+
+_AG_SWAP_ATTR = "_all_gather_out_place"
+
+
+def tp_pynccl_comm():
+    """The TP group's captured-role pynccl communicator, or None.
+
+    Returns ``(tp_group, comm)`` when the TP group's device communicator
+    exposes an enabled pynccl communicator (the one that already carries
+    the captured-graph all_reduces), else None. Pure python lookup: safe
+    from any context, including inside a CUDA-graph capture.
+    """
+    try:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        tp = get_tp_group()
+        dc = getattr(tp, "device_communicator", None)
+        comm = getattr(dc, "pynccl_comm", None) if dc is not None else None
+        if comm is None or getattr(comm, "disabled", True):
+            return None
+        return tp, comm
+    except Exception:
+        return None
+
+
+@contextmanager
+def captured_ag_scope() -> Iterator[None]:
+    """Record this rank's in-scope TP all_gathers on the pynccl comm.
+
+    Instance-level swap of the TP coordinator's ``_all_gather_out_place``
+    (both the direct call and the ``torch.ops.vllm.all_gather`` custom op
+    resolve through it). Active ONLY inside a CUDA-graph capture of an
+    audited adapter (the DSpark draft graph): the captured all_gather
+    then records on -- and every replay re-executes from -- the
+    captured-role pynccl communicator, keeping the shared c10d
+    communicator free of captured collectives (single role: eager AGs).
+
+    Outside a capture the scope is a no-op: eager all_gathers keep the
+    original (c10d) path, and no state is touched. When the pynccl
+    communicator is unavailable the scope degrades to a warning (strict
+    mode: fatal) and leaves the original path in place -- which puts the
+    deployment back on the captured-x-eager topology, so strict
+    validation runs must not proceed silently.
+    """
+    if not role_separation_enabled():
+        yield
+        return
+    if not torch.cuda.is_current_stream_capturing():
+        yield
+        return
+    pair = tp_pynccl_comm()
+    if pair is None:
+        raise_or_warn(
+            "Kimi-K3 role separation: no enabled TP pynccl communicator, so "
+            "a captured draft-logits all_gather would record on the shared "
+            "c10d communicator together with the per-step eager "
+            "all_gathers -- the captured-x-eager pair that deadlocks RCCL "
+            "(set VLLM_ROLE_SEP_STRICT=1 to make this fatal)."
+        )
+        yield
+        return
+    tp, comm = pair
+    ws = tp.world_size
+    saved = tp.__dict__.get(_AG_SWAP_ATTR)
+    original = saved if saved is not None else tp._all_gather_out_place
+
+    def _shim(input_: torch.Tensor, dim: int = -1, _comm=comm, _ws=ws):
+        # Capture-time enqueue on the captured-role comm; replay re-executes
+        # the recorded ncclAllGather from it. Layout mirrors the base-class
+        # concat all-gather (all_gather_into_tensor semantics) so the
+        # gathered logits stay bit-identical to the eager path.
+        if dim < 0:
+            dim += input_.dim()
+        inp = input_.contiguous()
+        size = inp.size()
+        output = torch.empty(
+            (size[0] * _ws,) + size[1:], dtype=inp.dtype, device=inp.device
+        )
+        _comm.all_gather(output, inp)
+        output = output.reshape((_ws,) + size).movedim(0, dim)
+        return output.reshape(
+            size[:dim] + (size[dim] * _ws,) + size[dim + 1:]
+        )
+
+    tp.__dict__[_AG_SWAP_ATTR] = _shim
+    try:
+        yield
+    finally:
+        if saved is None:
+            tp.__dict__.pop(_AG_SWAP_ATTR, None)
+        else:
+            tp.__dict__[_AG_SWAP_ATTR] = saved

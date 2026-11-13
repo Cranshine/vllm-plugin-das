@@ -145,9 +145,11 @@ class _RoleSepFixtures:
             hf_config=SimpleNamespace(draft_vocab_size=None)
         )
         self.query_cudagraph_manager = None
+        self.gathered_logits = None
         self.build()
 
     def init_cudagraph_manager(self, cudagraph_mode):
+        # The audited original: a plain replay entry with NO grown tail.
         self.query_cudagraph_manager = SimpleNamespace(
             run_fullgraph=lambda desc: self.replayed.append(desc)
         )
@@ -164,7 +166,22 @@ class _RoleSepFixtures:
         num_tokens_across_dp,
         cudagraph_runtime_mode=CUDAGraphMode.NONE,
     ):
-        raise AssertionError("legacy path must not run under role separation")
+        # Audited original: the whole draft step in one body. The logits
+        # all_gather goes through the real chain
+        # (tensor_model_parallel_all_gather -> GroupCoordinator.all_gather
+        # -> _all_gather_out_place) so the test observes which
+        # communicator the captured AG lands on.
+        from vllm.distributed import tensor_model_parallel_all_gather
+
+        head_hidden = self._run_model(
+            num_tokens_padded,
+            attn_metadata,
+            slot_mappings,
+            num_tokens_across_dp,
+            cudagraph_runtime_mode,
+        )
+        shard = head_hidden[: num_reqs * self.num_speculative_steps]
+        self.gathered_logits = tensor_model_parallel_all_gather(shard, dim=-1)
 
     def _run_model(
         self,
@@ -178,7 +195,7 @@ class _RoleSepFixtures:
 
     def build(self):
         self.replayed = []
-        self.head_hidden = torch.arange(16, dtype=torch.float32)
+        self.head_hidden = torch.arange(16, dtype=torch.float32).view(16, 1)
         self.sample_indices = torch.arange(16, dtype=torch.int64)
         self.draft_model_stub = SimpleNamespace(
             compute_draft_logits_shard=lambda hidden: hidden,
@@ -208,7 +225,101 @@ def _install_target(monkeypatch, dspark_cls):
     return target
 
 
-def test_dspark_draft_role_sep_moves_ag_out_of_graph(monkeypatch):
+class _FakePynccl:
+    """Stand-in for the TP group's captured-role pynccl communicator."""
+
+    disabled = False
+
+    def __init__(self, world_size):
+        self.world_size = world_size
+        self.ag_calls = []
+
+    def all_gather(self, output, inp):
+        self.ag_calls.append((tuple(inp.shape), tuple(output.shape)))
+        # ncclAllGather concat semantics: rank shards stacked along dim 0.
+        output.copy_(torch.cat([inp] * self.world_size, dim=0))
+
+
+class _FakeTPGroup:
+    """Stand-in for GroupCoordinator with a swappable AG entry point."""
+
+    def __init__(self, world_size=2, with_pynccl=True):
+        self.world_size = world_size
+        self.calls = []
+        if with_pynccl:
+            self.pynccl = _FakePynccl(world_size)
+            self.device_communicator = SimpleNamespace(pynccl_comm=self.pynccl)
+        else:
+            self.device_communicator = SimpleNamespace(pynccl_comm=None)
+
+    def _all_gather_out_place(self, input_, dim):
+        # Original path: c10d all_gather_into_tensor equivalent.
+        self.calls.append((tuple(input_.shape), dim))
+        return torch.cat([input_] * self.world_size, dim=dim)
+
+
+def test_captured_ag_scope_routes_ag_to_pynccl_and_restores(monkeypatch):
+    fake_tp = _FakeTPGroup(2)
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_tp_group", lambda: fake_tp
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    original = _FakeTPGroup._all_gather_out_place
+    with rs.captured_ag_scope():
+        shim = fake_tp.__dict__[rs._AG_SWAP_ATTR]
+        out = shim(torch.tensor([[1.0, 2.0]]), -1)
+        # dim=-1 concat layout, bit-identical to the original path.
+        assert torch.equal(out, torch.tensor([[1.0, 2.0, 1.0, 2.0]]))
+        out0 = shim(torch.tensor([[1.0, 2.0]]), 0)
+        assert torch.equal(out0, torch.tensor([[1.0, 2.0], [1.0, 2.0]]))
+        assert fake_tp.pynccl.ag_calls == [
+            ((1, 2), (2, 2)),
+            ((1, 2), (2, 2)),
+        ]
+        assert fake_tp.calls == []
+    # Restored: the instance-level swap is gone, the class method resolves,
+    # and later AGs ride the original (c10d) path again.
+    assert rs._AG_SWAP_ATTR not in fake_tp.__dict__
+    assert _FakeTPGroup.__dict__["_all_gather_out_place"] is original
+    fake_tp._all_gather_out_place(torch.tensor([[1.0]]), -1)
+    assert fake_tp.calls == [((1, 1), -1)]
+    assert fake_tp.pynccl.ag_calls[-1] == ((1, 2), (2, 2))  # unchanged
+
+
+def test_captured_ag_scope_noop_when_not_capturing_or_disabled(monkeypatch):
+    fake_tp = _FakeTPGroup(2)
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_tp_group", lambda: fake_tp
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    with rs.captured_ag_scope():
+        assert rs._AG_SWAP_ATTR not in fake_tp.__dict__
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setenv("VLLM_ROLE_SEP", "0")
+    with rs.captured_ag_scope():
+        assert rs._AG_SWAP_ATTR not in fake_tp.__dict__
+    assert fake_tp.pynccl.ag_calls == []
+
+
+def test_captured_ag_scope_warns_without_pynccl(monkeypatch):
+    fake_tp = _FakeTPGroup(2, with_pynccl=False)
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_tp_group", lambda: fake_tp
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with rs.captured_ag_scope():
+        # Degraded: no swap, the captured AG would fall back to the shared
+        # c10d communicator.
+        assert rs._AG_SWAP_ATTR not in fake_tp.__dict__
+    # Strict mode makes the same degradation fatal at capture time.
+    monkeypatch.setenv("VLLM_ROLE_SEP_STRICT", "1")
+    with pytest.raises(RuntimeError, match="pynccl"):
+        with rs.captured_ag_scope():
+            pass
+
+
+def test_dspark_whole_graph_capture_routes_ag_onto_pynccl(monkeypatch):
     monkeypatch.setattr(
         "vllm.distributed.get_tensor_model_parallel_world_size", lambda: 2
     )
@@ -219,119 +330,60 @@ def test_dspark_draft_role_sep_moves_ag_out_of_graph(monkeypatch):
 
     spec = dspark_cls(SimpleNamespace(), "cpu")
     # __init__ wrapper armed the role-separation state under default env.
-    assert spec._ag_out_of_graph is True
-    assert spec._logits_shard_width is None
+    assert spec._draft_ag_pynccl is True
+    # The adapter no longer wraps the cudagraph manager: replay stays the
+    # audited original (whole graph, no grown eager tail).
+    assert not hasattr(dspark_cls, "init_cudagraph_manager") or not getattr(
+        dspark_cls.init_cudagraph_manager, patch_dspark_draft_role_sep._WRAPPER, False
+    )
 
+    fake_tp = _FakeTPGroup(2)
+    monkeypatch.setattr(rs, "tp_pynccl_comm", lambda: (fake_tp, fake_tp.pynccl))
     loaded = spec.load_draft_model(object(), set())
-    spec.model = loaded  # the spec-decode worker wires the draft model here
-    assert loaded is spec.draft_model_stub
-    assert spec._logits_shard_width == 32
-    assert spec.draft_logits_shard.shape == (16, 32)
+    spec.model = loaded
+    assert spec._draft_ag_pynccl is True
 
-    # init_cudagraph_manager wrapper grows the eager replay tail, DSpark-only.
+    # Route the fixture's AG through the real coordinator chain.
+    monkeypatch.setattr(
+        "vllm.distributed.tensor_model_parallel_all_gather",
+        lambda t, dim=-1: fake_tp._all_gather_out_place(t, dim),
+    )
     spec.init_cudagraph_manager(None)
     mgr = spec.query_cudagraph_manager
-    assert getattr(mgr.run_fullgraph,
-                   patch_dspark_draft_role_sep._TAIL_WRAPPER)
+    assert getattr(mgr.run_fullgraph, "__name__", "") == "<lambda>"
 
-    # FULL decode step: the captured segment only writes the shard...
-    captured_calls = []
-
-    def shard_recorder(hidden):
-        captured_calls.append(hidden)
-        return torch.full((2, 32), 0.25)
-
-    spec.draft_model_stub.compute_draft_logits_shard = shard_recorder
-    monkeypatch.setattr(
-        torch.cuda, "is_current_stream_capturing", lambda: False
-    )
-
+    # Capture: the whole draft step records with the AG on the pynccl comm.
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     spec._generate_draft(
-        1,
-        4,
-        None,
-        None,
-        None,
-        cudagraph_runtime_mode=CUDAGraphMode.FULL,
+        2, 4, None, None, None, cudagraph_runtime_mode=CUDAGraphMode.FULL
     )
-    assert len(captured_calls) == 1
-    assert spec.draft_logits_shard.shape == (16, 32)
-    assert torch.all(spec.draft_logits_shard[:2] == 0.25)
+    assert fake_tp.pynccl.ag_calls == [((4, 1), (8, 1))]
+    assert fake_tp.calls == []
+    assert spec.gathered_logits.shape == (4, 2)
 
-    # ...and the eager tail gathers + samples after replay, with the same
-    # partition dim semantics as the eager LogitsProcessor path.
-    gathered = []
-
-    def fake_all_gather(shard_tensor, dim=-1):
-        gathered.append((tuple(shard_tensor.shape), dim))
-        return torch.cat([shard_tensor] * 2, dim=dim)
-
-    monkeypatch.setattr(
-        "vllm.distributed.tensor_model_parallel_all_gather", fake_all_gather
-    )
-    markov_inputs = []
-
-    def fake_markov(num_reqs, base_logits):
-        markov_inputs.append((num_reqs, tuple(base_logits.shape)))
-
-    spec._markov_sample = fake_markov
-    spec.replayed.append("desc")
-    # Invoke the tail the way the wrapped manager would: desc carries tokens
-    # only, so num_reqs falls back to min(num_tokens, max_num_reqs) = 3.
-    desc = SimpleNamespace(num_reqs=None, num_tokens=3)
-    mgr.run_fullgraph(desc)
-    assert spec.replayed[0] == "desc"
-    assert spec.replayed[1] is desc
-    assert gathered == [((6, 32), -1)]
-    assert markov_inputs == [(3, (3, 2, 64))]
+    # Eager (context phase / warmup): the stock c10d path, untouched.
+    spec.gathered_logits = None
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    spec._generate_draft(2, 4, None, None, None, cudagraph_runtime_mode=None)
+    assert fake_tp.calls == [((4, 1), -1)]
+    assert len(fake_tp.pynccl.ag_calls) == 1
 
 
-def test_dspark_role_sep_wraps_owned_cudagraph_manager(monkeypatch):
+def test_dspark_load_draft_model_degrades_without_pynccl(monkeypatch):
     monkeypatch.setattr(
         "vllm.distributed.get_tensor_model_parallel_world_size", lambda: 2
     )
     dflash_cls, dspark_cls = _make_speculator_cls()
-    # Recent bodies define init_cudagraph_manager on the DSpark class itself.
-    # The audited @override semantics delegate to the superclass chain either
-    # way, so the adapter must wrap the owned implementation, not reject it.
-    dspark_cls.init_cudagraph_manager = dflash_cls.init_cudagraph_manager
     target = _install_target(monkeypatch, dspark_cls)
     assert patch_dspark_draft_role_sep.apply_to_module(target)
-    hcu_wrapped = dspark_cls.__dict__["init_cudagraph_manager"]
-    assert getattr(hcu_wrapped, patch_dspark_draft_role_sep._WRAPPER, False)
+    monkeypatch.setattr(rs, "tp_pynccl_comm", lambda: None)
 
-    # The owned implementation is the audited original: the wrapper must
-    # still grow the eager replay tail on the built manager.
     spec = dspark_cls(SimpleNamespace(), "cpu")
-    spec.model = spec.load_draft_model(object(), set())
-    spec.init_cudagraph_manager(None)
-    mgr = spec.query_cudagraph_manager
-    assert getattr(mgr.run_fullgraph,
-                   patch_dspark_draft_role_sep._TAIL_WRAPPER)
-
-
-def test_dspark_draft_role_sep_rejects_shipped_new_api(monkeypatch):
-    monkeypatch.setattr(
-        "vllm.distributed.get_tensor_model_parallel_world_size", lambda: 2
-    )
-    dflash_cls, dspark_cls = _make_speculator_cls()
-    # The target already ships the role-separated helpers: the audited
-    # migration is obsolete and must not patch on top of it.
-    dspark_cls._markov_sample = lambda *args, **kwargs: None
-    target = _install_target(monkeypatch, dspark_cls)
-    with pytest.raises(patch_dspark_draft_role_sep.PatchCompatibilityError):
-        patch_dspark_draft_role_sep.apply_to_module(target)
-
-
-def test_gather_guard_uses_strict_env(monkeypatch):
-    monkeypatch.setattr(
-        torch.cuda, "is_current_stream_capturing", lambda: True
-    )
-    monkeypatch.setenv("VLLM_ROLE_SEP_STRICT", "1")
-    with pytest.raises(RuntimeError, match="captured"):
-        patch_dspark_draft_role_sep._guard_captured_draft_all_gather("t")
-    monkeypatch.setenv("VLLM_ROLE_SEP_STRICT", "0")
-    patch_dspark_draft_role_sep._guard_captured_draft_all_gather("t")
+    assert spec._draft_ag_pynccl is True
+    spec.load_draft_model(object(), set())
+    # Loud degradation: the captured AG would fall back to the shared c10d
+    # communicator, so the adapter disarms rather than patching silently.
+    assert spec._draft_ag_pynccl is False
 
 
 def test_scope_is_noop_when_disabled_or_capturing(monkeypatch):

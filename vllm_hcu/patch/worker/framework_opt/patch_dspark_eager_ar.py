@@ -8,10 +8,11 @@ Two audited changes on ``K3DSparkForCausalLM``:
     model's eager TP all_reduces (prefill/context phases) never share the
     captured-role TP communicator (RCCL captured-x-eager deadlock).
   - ``compute_draft_logits_shard`` exposes the lm_head projection WITHOUT
-    the logits all_gather, letting the draft speculator stop the captured
-    draft graph at a sharded logits write and run the all_gather eagerly
-    after each replay (see ``patch_dspark_draft_role_sep``). Pairing the
-    shard with an explicit ``tensor_model_parallel_all_gather`` reproduces
+    the logits all_gather. Retained from the pre-v2 adapter (which split
+    the captured draft graph at this write); the v2 whole-graph adapter
+    no longer calls it, but the API stays installed for parity with the
+    body-side fork and for eager-side diagnostics. Pairing the shard
+    with an explicit ``tensor_model_parallel_all_gather`` reproduces
     ``compute_logits`` bit-for-bit (same kernels, same gather semantics).
 """
 
