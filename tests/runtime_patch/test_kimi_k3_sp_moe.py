@@ -465,15 +465,25 @@ def test_impls_fall_back_to_stock_group_api(monkeypatch):
 
 
 def test_phase_comm_selection_table(monkeypatch):
-    """capturing -> TP pynccl comm; eager -> None (stock group API).
+    """capturing -> TP pynccl comm; eager -> role-sep auxiliary comm.
 
-    Role-separated eager collectives are deliberately out of scope for this
-    PR: there is no accessor, no latch, and no eager aux-comm branch to
-    mis-route with. A capturing invocation with an unusable TP pynccl comm
-    degrades to None -- the enablement preflight already refuses SP when
-    that comm cannot move data, so this is a defensive fallback only.
+    Captured SP collectives must stay on the communicator the graphs were
+    recorded on. Eager SP collectives must ride the role-separation
+    auxiliary communicator, because the TP pynccl comm also carries the
+    captured-graph collectives (mixing both roles deadlocks the RCCL
+    cross-node proxy). Without role separation the eager path keeps the
+    stock group API (None). A capturing invocation with an unusable TP
+    pynccl comm degrades to None defensively.
     """
     role_comm = types.SimpleNamespace(disabled=False, available=True)
+    aux = types.SimpleNamespace(disabled=False, available=True)
+
+    # This test exercises the routing table, not the resolver: latch the
+    # lazy rebind so the real role-separation module cannot overwrite the
+    # accessors monkeypatched below.
+    monkeypatch.setattr(sp, "_role_sep_resolved", True)
+    monkeypatch.setattr(sp, "_role_sep_enabled", lambda: True)
+    monkeypatch.setattr(sp, "_role_sep_aux_comm", lambda: aux)
 
     monkeypatch.setattr(
         sp.torch.cuda, "is_current_stream_capturing", lambda: True, raising=False
@@ -485,7 +495,7 @@ def test_phase_comm_selection_table(monkeypatch):
         ),
         raising=False,
     )
-    # Capturing: the captured-role comm.
+    # Capturing: the captured-role comm, never the eager aux comm.
     assert sp._phase_comm() is role_comm
 
     # Capturing with an unusable (disabled) comm: defensive fallback to None.
@@ -493,24 +503,55 @@ def test_phase_comm_selection_table(monkeypatch):
     assert sp._phase_comm() is None
     role_comm.disabled = False
 
-    # Eager: None -> the stock group API, whatever the comm looks like.
+    # Eager: the role-separation aux comm.
     monkeypatch.setattr(sp.torch.cuda, "is_current_stream_capturing", lambda: False)
+    assert sp._phase_comm() is aux
+
+    # Eager with an unusable aux comm: stock group API fallback.
+    aux.disabled = True
+    assert sp._phase_comm() is None
+    aux.disabled = False
+
+    # Eager with role separation disabled: stock group API.
+    monkeypatch.setattr(sp, "_role_sep_enabled", lambda: False)
     assert sp._phase_comm() is None
 
 
-def test_sp_patch_carries_no_role_separation():
-    """The role-separation workstream owns alias communicator routing.
+def test_role_separation_resolution_is_lazy_and_latched(monkeypatch):
+    """The provider is resolved once and the outcome (even off) is latched."""
+    calls = {"n": 0}
 
-    This PR's SP patch must not parse VLLM_ROLE_SEP, resolve any
-    role-separation module, or keep a resolution latch (the latch's
-    publish-before-assign window was exactly the reload race the review
-    rejected). Pins the removal so it cannot quietly creep back in here.
+    class _Provider:
+        @staticmethod
+        def role_separation_enabled():
+            return True
+
+        @staticmethod
+        def _get_aux_ar_comm():
+            return None
+
+    def fake_provider():
+        calls["n"] += 1
+        return _Provider
+
+    monkeypatch.setattr(sp, "_role_sep_resolved", False)
+    monkeypatch.setattr(sp, "_role_sep_provider", fake_provider)
+    sp._ensure_role_sep_resolved()
+    sp._ensure_role_sep_resolved()
+    assert calls["n"] == 1
+    assert sp._role_sep_enabled() is True
+
+
+def test_sp_patch_prefers_the_plugin_role_separation_provider():
+    """Our wheel ships no vllm.models.kimi_k3.role_separation module.
+
+    The SP patch must therefore fall back to the plugin-shipped
+    ``vllm_hcu.patch.worker.framework_opt._role_separation`` provider so the
+    eager SP collectives still get the isolated communicator.
     """
     src = open(sp.__file__, encoding="utf-8").read()
-    assert "ROLE_SEP" not in src
-    assert "role_sep" not in src
-    assert "_get_aux_ar_comm" not in src
-    assert "_role_separation" not in src
+    assert "vllm_hcu.patch.worker.framework_opt._role_separation" in src
+    assert sp._ROLE_SEP_CANDIDATES[0] == "vllm.models.kimi_k3.role_separation"
 
 
 def test_op_entries_resolve_the_live_module(monkeypatch):

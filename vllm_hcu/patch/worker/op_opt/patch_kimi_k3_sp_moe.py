@@ -363,15 +363,28 @@ def _vllm_warn(msg: str, *args) -> None:
 
     _vllogger.warning(msg, *args)
 
-_ROLE_SEP_MODULE = "vllm.models.kimi_k3.role_separation"
 _MARKER = "_vllm_hcu_kimi_k3_sp_moe_applied"
 _INIT_WRAPPER = "_vllm_hcu_kimi_k3_sp_moe_init_wrapper"
 _FORWARD_WRAPPER = "_vllm_hcu_kimi_k3_sp_moe_forward_wrapper"
 _LAYER_STATE = "_vllm_hcu_kimi_k3_sp_moe_state"
 
-# Resolved once at apply time when the switch is on.
+# Role-separation provider (cross-node RCCL captured-x-eager deadlock fix).
+# The upstream fork ships ``vllm.models.kimi_k3.role_separation``; the
+# plugin-shipped tree keeps the same contract in
+# ``vllm_hcu.patch.worker.framework_opt._role_separation``. Resolve lazily
+# (after patch reloads) and latch the outcome -- including the no-provider
+# outcome, which must not be re-probed (or re-flipped) per collective.
+_ROLE_SEP_CANDIDATES = (
+    "vllm.models.kimi_k3.role_separation",
+    "vllm_hcu.patch.worker.framework_opt._role_separation",
+)
+
 _role_sep_enabled = None
 _role_sep_aux_comm = None
+_role_sep_resolved = False
+_role_sep_provider_name = None
+_warned_fallback = False
+_aux_route_logged = False
 
 # Latent-width admission for the DeepEP-LL path (Kimi-K3 latent MoE).
 #
@@ -645,8 +658,10 @@ class _SpState:
 
 
 # ---------------------------------------------------------------------------
-# Collectives: capture-time pynccl / eager-time stock group API -- the
-# deployment's stock single-comm topology, no second comm is created.
+# Collectives: phase-routed so no communicator gains a second role.
+#   capturing -> the TP pynccl comm recorded by the captured graphs;
+#   eager     -> the role-separation auxiliary comm when available, else the
+#                stock group API (legacy single-comm topology, with a warning).
 # ---------------------------------------------------------------------------
 
 
@@ -658,35 +673,97 @@ def _usable(comm) -> bool:
     )
 
 
+def _role_sep_provider():
+    """Import the role-separation provider (fork module, else plugin module)."""
+    global _role_sep_provider_name
+    import importlib
+
+    for name in _ROLE_SEP_CANDIDATES:
+        try:
+            provider = importlib.import_module(name)
+        except Exception:
+            continue
+        _role_sep_provider_name = name
+        return provider
+    return None
+
+
+def _ensure_role_sep_resolved() -> None:
+    """Resolve the role-separation accessors lazily and latch the result."""
+    global _role_sep_enabled, _role_sep_aux_comm, _role_sep_resolved
+    if _role_sep_resolved:
+        return
+    provider = _role_sep_provider()
+    if provider is None:
+        _role_sep_enabled = lambda: False
+        _role_sep_aux_comm = lambda: None
+    else:
+        _role_sep_enabled = getattr(provider, "role_separation_enabled", None) or (
+            lambda: False
+        )
+        _role_sep_aux_comm = getattr(provider, "_get_aux_ar_comm", None) or (
+            lambda: None
+        )
+    _role_sep_resolved = True
+
+
+def _log_aux_route_once() -> None:
+    global _aux_route_logged
+    if _aux_route_logged:
+        return
+    _aux_route_logged = True
+    from vllm.logger import init_logger
+
+    init_logger(__name__).info(
+        "SP-MoE eager collectives routed to the role-separation auxiliary "
+        "communicator (provider=%s).",
+        _role_sep_provider_name,
+    )
+
+
 def _phase_comm():
-    """TP pynccl comm for captured calls, None for eager ones.
+    """PyNccl comm owning this call's role, or None for the stock group API.
 
     Only executed at real invocation time. While dynamo traces, the two SP
     collectives are opaque custom ops whose fake impl answers shapes, so this
     predicate never runs at trace time and no routing decision is baked into
     a compiled graph (P1: a compile-time fallback would mix communicator
-    roles during prefill/decode interleaving). Eager calls intentionally
-    return None (the stock group API): a dedicated eager-role communicator
-    is role-separation workstream scope, not this PR's.
+    roles during prefill/decode interleaving).
+
+    Eager collectives ride the role-separation auxiliary communicator when
+    one is available: the TP pynccl comm already carries the captured-graph
+    collectives, and mixing captured and eager submissions on it deadlocks
+    the RCCL cross-node proxy. When role separation is off/unavailable this
+    returns None and the stock group API keeps the legacy topology.
     """
     if torch.cuda.is_current_stream_capturing():
         from vllm.distributed import get_tp_group
 
         comm = getattr(get_tp_group().device_communicator, "pynccl_comm", None)
         return comm if _usable(comm) else None
-    return None
+    _ensure_role_sep_resolved()
+    if _role_sep_enabled is None or not _role_sep_enabled():
+        return None
+    comm = _role_sep_aux_comm()
+    if not _usable(comm):
+        return None
+    _log_aux_route_once()
+    return comm
 
 
 def _warn_fallback(phase: str) -> None:
-    # warning_once dedupes per message, so no module-level "already warned"
-    # flag is needed (and none survives reloads). The stock-API route is the
-    # designed eager topology here; the warning exists so an operator who
-    # expected a dedicated eager comm notices where the collectives went.
+    """Warn once when an eager SP collective falls back to the stock group."""
+    global _warned_fallback
+    if _warned_fallback:
+        return
+    _warned_fallback = True
     from vllm.logger import init_logger
 
-    init_logger(__name__).warning_once(
-        "SP-MoE %s uses the stock TP group API (expected without a "
-        "role-separated eager comm).",
+    init_logger(__name__).warning(
+        "SP-MoE %s routed through the stock TP group API (no role-separated "
+        "eager comm available: role separation disabled or its auxiliary "
+        "communicator is unusable). If a role-separated topology was "
+        "expected, check VLLM_ROLE_SEP / VLLM_ROLE_SEP_STRICT.",
         phase,
     )
 

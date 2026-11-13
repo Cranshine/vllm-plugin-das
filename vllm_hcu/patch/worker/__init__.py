@@ -433,11 +433,22 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
         _adapter("framework_opt", "patch_draft_speculator_inputs"),
     ),
     # Wraps whatever DSpark draft loader adapter installed at callback time
-    # by object identity, not by rebinding module globals (role-separation
-    # adapters do not exist on this line; ordering after
-    # patch_draft_speculator_inputs is still required).
+    # by object identity, not by rebinding module globals (ordering after
+    # patch_draft_speculator_inputs is required).
     _CallbackSpec(
         _adapter("framework_opt", "patch_smoke_draft_guard"),
+    ),
+    # Captured vs eager TP collectives must live on separate communicators
+    # (role separation, RCCL hang); ordered after the draft speculator inputs
+    # so the DSpark-owned cudagraph manager is already the smoke guard's.
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_kimi_k3_eager_ar"),
+    ),
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_dspark_eager_ar"),
+    ),
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_dspark_draft_role_sep"),
     ),
     _CallbackSpec(_adapter("framework_opt", "patch_gpu_ubatch_wrapper")),
     _CallbackSpec(_adapter("framework_opt", "patch_ubatch_utils")),
