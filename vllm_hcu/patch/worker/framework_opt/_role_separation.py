@@ -57,7 +57,11 @@ if TYPE_CHECKING:
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
     from vllm.distributed.parallel_state import GroupCoordinator
 
-logger = init_logger(__name__)
+# The "vllm." prefix is required for serve visibility: vLLM's dictConfig
+# attaches its handler to the vllm logger only (propagate=False), so a plain
+# init_logger(__name__) record is silently dropped and the role-separation
+# state is unknowable from server logs (patch_kimi_k3_sp_moe.py:334).
+logger = init_logger("vllm.hcu.rolesep")
 
 # Factory default is on: this fix ships with the Kimi-K3 DCU deployment,
 # where mixed-role communicators deadlock the RCCL stack. Set

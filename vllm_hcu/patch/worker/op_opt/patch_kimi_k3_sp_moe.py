@@ -712,9 +712,8 @@ def _log_aux_route_once() -> None:
     if _aux_route_logged:
         return
     _aux_route_logged = True
-    from vllm.logger import init_logger
-
-    init_logger(__name__).info(
+    # "vllm." prefix: serve-visible (see the note at this file's line 334).
+    _vllm_info_once(
         "SP-MoE eager collectives routed to the role-separation auxiliary "
         "communicator (provider=%s).",
         _role_sep_provider_name,
@@ -757,9 +756,8 @@ def _warn_fallback(phase: str) -> None:
     if _warned_fallback:
         return
     _warned_fallback = True
-    from vllm.logger import init_logger
-
-    init_logger(__name__).warning(
+    # "vllm." prefix: serve-visible (see the note at this file's line 334).
+    _vllm_warn(
         "SP-MoE %s routed through the stock TP group API (no role-separated "
         "eager comm available: role separation disabled or its auxiliary "
         "communicator is unusable). If a role-separated topology was "

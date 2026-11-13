@@ -101,7 +101,11 @@ def _hcu_role_sep_init(self, vllm_config, device):
     self.draft_logits_shard = None
     from vllm.logger import init_logger
 
-    init_logger(__name__).info(
+    # The "vllm." prefix is required for serve visibility: vLLM's dictConfig
+    # attaches its handler to the vllm logger only (propagate=False), so a
+    # plain init_logger(__name__) record is silently dropped and the armed
+    # state is unknowable from server logs (patch_kimi_k3_sp_moe.py:334).
+    init_logger("vllm.hcu.rolesep").info(
         "[role-sep] DSpark draft AG-out-of-graph=%s (role_sep=%s tp=%d)",
         self._ag_out_of_graph,
         role_separation_enabled(),
@@ -140,7 +144,8 @@ def _hcu_role_sep_load_draft_model(self, target_model, target_attn_layer_names):
             )
             from vllm.logger import init_logger
 
-            init_logger(__name__).info(
+            # "vllm." prefix: serve-visible (see patch_kimi_k3_sp_moe.py:334).
+            init_logger("vllm.hcu.rolesep").info(
                 "[role-sep] draft lm_head shard width=%d -> captured draft "
                 "graph is collective-free; eager AG+Markov tail armed",
                 shard_width,
@@ -399,7 +404,8 @@ def apply_to_module(module: ModuleType) -> bool:
     setattr(spec, _MARKER, True)
     from vllm.logger import init_logger
 
-    init_logger(__name__).info(
+    # "vllm." prefix: serve-visible (see patch_kimi_k3_sp_moe.py:334).
+    init_logger("vllm.hcu.rolesep").info(
         "[role-sep] armed: DSpark draft graph AG-out-of-graph adapter"
     )
     return True

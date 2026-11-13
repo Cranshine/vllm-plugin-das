@@ -73,7 +73,11 @@ def apply_to_module(module: ModuleType) -> bool:
     setattr(lin, _MARKER, True)
     from vllm.logger import init_logger
 
-    init_logger(__name__).info(
+    # The "vllm." prefix is required for serve visibility: vLLM's dictConfig
+    # attaches its handler to the vllm logger only (propagate=False), so a
+    # plain init_logger(__name__) record is silently dropped and the armed
+    # state is unknowable from server logs (patch_kimi_k3_sp_moe.py:334).
+    init_logger("vllm.hcu.rolesep").info(
         "[role-sep] armed: eager TP all_reduce scope on "
         "KimiLinearForCausalLM.forward"
     )
