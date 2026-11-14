@@ -216,6 +216,23 @@ def apply_to_module(module: ModuleType) -> bool:
                     positions=positions,
                     output=attn_output,
                 )
+            elif getattr(self, "_hcu_prequant_via_pin", False):
+                # K3.1 DSA layers route through the stock generic MLA
+                # wrapper, whose forward signature stays (positions,
+                # hidden_states). Pin the fused pair on the target
+                # projection; the wrapper's bare proj(hidden) call consumes
+                # it inside LinearBase._forward_with_hcu_quanted.
+                proj = getattr(
+                    getattr(self.self_attn, "mla_attn", None),
+                    "fused_qkv_a_proj", None,
+                )
+                if proj is not None:
+                    proj._hcu_next_quanted = (q_quanted, s_quanted)
+                self.self_attn(
+                    hidden_states=hidden_states,
+                    positions=positions,
+                    output=attn_output,
+                )
             else:
                 self.self_attn(
                     hidden_states=hidden_states,
@@ -230,14 +247,20 @@ def apply_to_module(module: ModuleType) -> bool:
     def _enable_fused_rms_quant(layer) -> None:
         """Swap the QKV-feeding norms for FusedRMSNormAndQuant in place.
 
-        Only dense K3 MLA layers qualify: the K3.1 DSA layers route through
-        the generic ``MultiHeadLatentAttentionWrapper``, whose forward does
-        not accept a prequantized pair, and KDA layers have no MLA QKV
-        projection. The RMSNorm weight Parameter object is shared with the
-        fused module, so ``load_weights`` keeps populating the same storage.
-        The swap is limited to attn-res blocks (K3.1 Pro), whose HCU
-        ``forward_attn_residual`` consumes the fused pair; the plain
-        ``forward`` residual path keeps its 2-tuple RMSNorm contract.
+        MLA layers qualify through either wrapper: the audited K3 wrapper
+        threads the pair via an extra forward kwarg, and the K3.1 DSA
+        layers — which on the Pro model are every full-attention layer —
+        route through the stock generic ``MultiHeadLatentAttentionWrapper``.
+        That generic forward signature stays untouched; the pair travels
+        pinned on the projection (``_hcu_next_quanted``) and is consumed by
+        its bare ``proj(hidden)`` call in
+        ``LinearBase._forward_with_hcu_quanted``. KDA layers have no MLA
+        QKV projection and stay excluded. The RMSNorm weight Parameter
+        object is shared with the fused module, so ``load_weights`` keeps
+        populating the same storage. The swap is limited to attn-res blocks
+        (K3.1 Pro), whose HCU ``forward_attn_residual`` consumes the fused
+        pair; the plain ``forward`` residual path keeps its 2-tuple RMSNorm
+        contract.
         """
         if not (
             henvs.VLLM_HCU_USE_FUSED_RMS_QUANT and henvs.custom_ops_enabled()
@@ -249,10 +272,18 @@ def apply_to_module(module: ModuleType) -> bool:
         attention = getattr(layer, "self_attn", None)
         if attention_cls is None or not isinstance(attention, attention_cls):
             return
-        if not isinstance(
-            getattr(attention, "mla_attn", None), target.KimiK3MultiHeadLatentAttentionWrapper
-        ):
-            return
+        mla_attn = getattr(attention, "mla_attn", None)
+        if isinstance(mla_attn, target.KimiK3MultiHeadLatentAttentionWrapper):
+            layer._hcu_prequant_via_pin = False
+        else:
+            # Generic wrapper (K3.1 DSA): requires a HCU projection to
+            # carry the pinned pair.
+            proj = getattr(mla_attn, "fused_qkv_a_proj", None)
+            if proj is None or not callable(
+                getattr(proj, "_forward_with_hcu_quanted", None)
+            ):
+                return
+            layer._hcu_prequant_via_pin = True
         if getattr(attention, "q_lora_rank", None) is None:
             return
         # Only input_layernorm is fused: it feeds the QKV projection, whose
