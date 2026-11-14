@@ -368,14 +368,19 @@ def test_fused_rms_quant_dsa_subclass_threads_prequant(
 def test_envs_fused_rms_quant_gate_truth_table(monkeypatch):
     monkeypatch.delenv("VLLM_HCU_USE_FUSED_RMS_QUANT", raising=False)
     monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_OPS", raising=False)
-    assert henvs.fused_rms_quant_enabled() is False
+    # Default-on: the fused opt ships enabled; only an explicit opt-out or
+    # the custom-op master turning it off drops it.
+    assert henvs.fused_rms_quant_enabled() is True
     monkeypatch.setenv("VLLM_HCU_USE_FUSED_RMS_QUANT", "1")
     assert henvs.fused_rms_quant_enabled() is True
-    # master switch off => gate off regardless of the child switch
-    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    # explicit opt-out wins
+    monkeypatch.setenv("VLLM_HCU_USE_FUSED_RMS_QUANT", "0")
     assert henvs.fused_rms_quant_enabled() is False
-    monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_OPS", raising=False)
     monkeypatch.setenv("VLLM_HCU_USE_FUSED_RMS_QUANT", "False")
+    assert henvs.fused_rms_quant_enabled() is False
+    # master switch off => gate off regardless of the child switch
+    monkeypatch.delenv("VLLM_HCU_USE_FUSED_RMS_QUANT", raising=False)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
     assert henvs.fused_rms_quant_enabled() is False
 
 

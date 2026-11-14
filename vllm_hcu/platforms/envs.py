@@ -64,7 +64,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_LIGHTOP_PER_TOKEN_QUANT_FP8: bool = False
     VLLM_HCU_FUSED_MOE_CHUNK_SIZE: Optional[int] = None
     VLLM_HCU_USE_GLOBAL_MOE_CACHE: bool = False
-    VLLM_HCU_USE_FUSED_RMS_QUANT: bool = False
+    VLLM_HCU_USE_FUSED_RMS_QUANT: bool = True
     VLLM_HCU_USE_FUSE_SILU_AND_MUL: bool = False
     VLLM_HCU_USE_FUSED_SILU_MUL_QUANT: bool = False
     VLLM_HCU_USE_FUSED_QKV_SPLIT_RMS_ROPE_KVSTORE: bool = False
@@ -135,16 +135,18 @@ def optional_custom_op_enabled(feature_enabled: bool = True) -> bool:
 
 
 def fused_rms_quant_enabled() -> bool:
-    """Effective fused input-rmsnorm+int8-quant opt-in under the master.
+    """Effective fused input-rmsnorm+int8-quant policy under the master.
 
     Single source for the gate: the decoder patch, the K3.1 DSA wrapper
     selection, and any future consumer resolve through this helper instead
     of re-inlining ``VLLM_HCU_USE_FUSED_RMS_QUANT and custom_ops_enabled()``,
-    so the two know one policy by construction.
+    so the two know one policy by construction. The opt is on by default;
+    set ``VLLM_HCU_USE_FUSED_RMS_QUANT=0`` to fall back to the unfused
+    rmsnorm + separate quant path.
     """
 
     return optional_custom_op_enabled(
-        _environment_flag(os.environ.get("VLLM_HCU_USE_FUSED_RMS_QUANT", "False"))
+        _environment_flag(os.environ.get("VLLM_HCU_USE_FUSED_RMS_QUANT", "True"))
     )
 
 
@@ -675,9 +677,9 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
         lambda: (os.environ.get("VLLM_HCU_USE_GLOBAL_MOE_CACHE", "False").lower() in
                  ("true", "1")),
 
-    # If use fused rmsnorm and quant, please set True
+    # Fused input rmsnorm+int8-quant: on by default; set 0/false to opt out.
     "VLLM_HCU_USE_FUSED_RMS_QUANT":
-        lambda: (os.environ.get("VLLM_HCU_USE_FUSED_RMS_QUANT", "False").lower() in
+        lambda: (os.environ.get("VLLM_HCU_USE_FUSED_RMS_QUANT", "True").lower() in
                  ("true", "1")),
 
     # If set, use LightOp's fused SiLU-and-multiply kernel.
