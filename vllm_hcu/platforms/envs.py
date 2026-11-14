@@ -134,6 +134,20 @@ def optional_custom_op_enabled(feature_enabled: bool = True) -> bool:
     return custom_ops_enabled() and bool(feature_enabled)
 
 
+def fused_rms_quant_enabled() -> bool:
+    """Effective fused input-rmsnorm+int8-quant opt-in under the master.
+
+    Single source for the gate: the decoder patch, the K3.1 DSA wrapper
+    selection, and any future consumer resolve through this helper instead
+    of re-inlining ``VLLM_HCU_USE_FUSED_RMS_QUANT and custom_ops_enabled()``,
+    so the two know one policy by construction.
+    """
+
+    return optional_custom_op_enabled(
+        _environment_flag(os.environ.get("VLLM_HCU_USE_FUSED_RMS_QUANT", "False"))
+    )
+
+
 def linear_gate_pcp_shard_enabled(
     *, tp_size: int, pcp_size: int, pp_size: int = 1
 ) -> bool:

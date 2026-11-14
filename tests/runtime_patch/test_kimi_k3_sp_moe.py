@@ -223,6 +223,91 @@ def test_sp_rows_match_replicated_domain(tp_size, num_tokens, block_write, prev_
         assert torch.equal(window, padded_partial[r * S : (r + 1) * S])
 
 
+def test_sp_forward_threads_the_fused_rms_quant_pair():
+    """Decoder-level fused input norm (3-tuple return) + SP forward.
+
+    Regression for the patch-combination crash: with ``_hcu_fused_rms_quant``
+    set the SP body must thread the (int8, scale) pair into ``_run_self_attn``
+    exactly like the reference ``forward_attn_residual`` -- never treat the
+    3-tuple as a tensor.
+    """
+    layer = _make_layer(
+        tp_rank=0, tp_size=2, block_write=False, prev_blocks=0
+    )
+    setattr(layer, "_hcu_fused_rms_quant", True)
+
+    class _FusedNorm:
+        def __call__(self, x, residual=None):
+            q = (x * 0.25).to(torch.int8)
+            s = torch.full((x.shape[0], 1), 0.5, dtype=torch.float32)
+            return q, s, None
+
+    seen: dict = {}
+    layer.input_layernorm = _FusedNorm()
+
+    def run_self_attn(positions, h, q_quanted=None, s_quanted=None):
+        seen["q"] = q_quanted
+        seen["s"] = s_quanted
+        return h * 3.0 + 1.0
+
+    layer._run_self_attn = run_self_attn
+
+    hs = torch.randn(4, 6)
+    br = torch.randn(4, 3, 6)
+    state = getattr(layer, sp._LAYER_STATE)
+    S = -(-hs.shape[0] // 2)  # tp_size=2 -> shard 2, no padding rows at N=4
+
+    def rs_window_stub(x, tp):
+        # Real contract: rank r receives rows [r*S, (r+1)*S) of the summed
+        # padded partials; this test runs rank 0 only.
+        assert x.shape[0] == S * 2
+        return x[0:S].clone()
+
+    def ag_window_stub(x, tp):
+        # Real contract: rank 0's shard lands at its own slot of the padded
+        # full domain (other slots zero -- sliced away by [:num_tokens]).
+        full = torch.zeros(S * 2, x.shape[1], dtype=x.dtype)
+        full[0:S] = x
+        return full
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(
+            torch.ops.vllm, "hcu_k3_sp_reduce_scatter",
+            rs_window_stub, raising=False,
+        )
+        mp.setattr(
+            torch.ops.vllm, "hcu_k3_sp_all_gather",
+            ag_window_stub, raising=False,
+        )
+        mp.setattr(sp, "_attn_res", _stub_attn_res)
+        prefix, br_out = sp._sp_forward_attn_residual(
+            layer, state, torch.zeros(4), hs, br
+        )
+    assert br_out is br
+    assert prefix.shape == (4, 6)
+    assert seen["q"] is not None
+    assert seen["q"].dtype == torch.int8
+    assert torch.equal(seen["q"], (hs * 0.25).to(torch.int8))
+    assert torch.equal(seen["s"], torch.full((4, 1), 0.5))
+
+
+def test_sp_forward_has_fused_norm_threading_branch():
+    """The SP body must keep the fused-pair branch in lockstep with the
+    reference forward_attn_residual (AST check; numerics are covered by the
+    parametrized matrix for the plain path and the pair-threading test
+    above for the fused path)."""
+    tree = ast.parse(_sp_forward_source())
+    fused_uses = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and node.value == "_hcu_fused_rms_quant"
+    ]
+    assert fused_uses, (
+        "_sp_forward_attn_residual lost the fused-norm threading branch; "
+        "a decoder with FusedRMSNormAndQuant input would crash on SP layers"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Router-side windowing (the REAL router_runtime helper): rank slices,
 # short-mask skip, no-window no-op.

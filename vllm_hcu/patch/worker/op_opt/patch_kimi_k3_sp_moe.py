@@ -944,10 +944,23 @@ def _sp_forward_attn_residual(
         block_residual[:, self.block_write_idx, :].copy_(prefix_sum)
         prefix_sum = None
 
-    hidden_states = self.input_layernorm(hidden_states)
-    # o_proj.reduce_results is False on SP layers: TP partial sums. Pad is
-    # unconditional and free when N is already padded.
-    attn_partial = self._run_self_attn(positions, hidden_states)
+    if getattr(self, "_hcu_fused_rms_quant", False):
+        # The decoder-level fused input norm returns the (int8, scale) pair
+        # for the QKV projection and normalizes in place (update_input=True
+        # keeps the bf16 residual stream). Thread the pair exactly like the
+        # reference forward_attn_residual does: _run_self_attn forwards it
+        # as the explicit x_and_scale_quanted kwarg. Without this branch the
+        # 3-tuple return would be treated as a tensor and explode at the
+        # first SP+fusion decode step.
+        q_quanted, s_quanted, _ = self.input_layernorm(hidden_states)
+        attn_partial = self._run_self_attn(
+            positions, hidden_states, q_quanted, s_quanted
+        )
+    else:
+        hidden_states = self.input_layernorm(hidden_states)
+        # o_proj.reduce_results is False on SP layers: TP partial sums. Pad is
+        # unconditional and free when N is already padded.
+        attn_partial = self._run_self_attn(positions, hidden_states)
     attn_full = torch.nn.functional.pad(
         attn_partial, (0, 0, 0, padded - num_tokens)
     )

@@ -28,6 +28,17 @@ def fake_moe_runner(monkeypatch):
     return runner_module
 
 
+@pytest.fixture
+def fake_k31_module(monkeypatch):
+    """Stand in for vllm_hcu.models.kimi_k31 (skips the heavy vllm model
+    import); the identity of KimiK31FusedQuantMLAWrapper is what the patch
+    isinstance whitelist checks, so the stub class is the real subject."""
+    k31_module = ModuleType("vllm_hcu.models.kimi_k31")
+    k31_module.KimiK31FusedQuantMLAWrapper = _FakeK31FusedMLAWrapper
+    monkeypatch.setitem(sys.modules, k31_module.__name__, k31_module)
+    return k31_module
+
+
 class _FakeRMSNorm(nn.Module):
     """Plain RMSNorm double matching the wheel module's contract."""
 
@@ -122,12 +133,62 @@ class _FakeKimiK3MLAWrapper(nn.Module):
 
 
 class _FakeGenericMLAWrapper(nn.Module):
-    """Stand-in for the generic wrapper DSA layers route through."""
+    """Stand-in for the plain generic wrapper (no prequant support).
+
+    DSA layers must route through :class:`_FakeK31FusedMLAWrapper` when the
+    fusion gate is on; this class exists to prove the whitelist still skips
+    wrappers that cannot carry the pair.
+    """
 
     def forward(self, positions, hidden_states, *args, **kwargs):
         raise AssertionError(
-            "DSA layers must not receive the fused prequant argument"
+            "plain generic wrappers must not receive the fused prequant arg"
         )
+
+
+class _FakeK31FusedMLAWrapper(nn.Module):
+    """K3.1 DSA fused wrapper double: submodules + explicit-pair capsule."""
+
+    def __init__(self, hidden_size=8, is_sparse=True):
+        super().__init__()
+        self.q_lora_rank = 4
+        self.kv_lora_rank = 4
+        self.qk_rope_head_dim = 1
+        self.qk_head_dim = 5
+        self.qk_nope_head_dim = 4
+        self.v_head_dim = 1
+        self.num_heads = 2
+        self.fused_qkv_a_proj = _FakeLinear(
+            hidden_size, self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim
+        )
+        self.q_a_layernorm = _FakeRMSNorm(self.q_lora_rank)
+        self.q_b_proj = _FakeLinear(
+            self.q_lora_rank, self.num_heads * self.qk_head_dim
+        )
+        self.kv_a_layernorm = _FakeRMSNorm(self.kv_lora_rank)
+        self.o_proj = _FakeLinear(self.num_heads * self.v_head_dim, hidden_size)
+        self.rotary_emb = None
+        self.indexer = None
+        self.is_sparse = is_sparse
+        self.skip_topk = False
+        self.fuse_qkv_rmsnorm = False
+        self.dcp_q_replicate = False
+        self.g_proj = None
+        self.mla_attn = _InnerMLA(self.num_heads * self.v_head_dim)
+        self.forward_kwargs = []
+
+    def forward(
+        self, positions, hidden_states, llama_4_scaling=None,
+        x_and_scale_quanted=None,
+    ):
+        if x_and_scale_quanted is not None:
+            self.fused_qkv_a_proj._forward_with_hcu_quanted(
+                hidden_states, x_and_scale_quanted
+            )
+        self.forward_kwargs.append(
+            {"x_and_scale_quanted": x_and_scale_quanted}
+        )
+        return torch.zeros(hidden_states.shape[0], 8)
 
 
 class _FakeKimiMLAAttention(nn.Module):
@@ -155,11 +216,14 @@ class _FakeKimiRoutedOutputTransform(nn.Module):
 class _FakeKimiDecoderLayer(nn.Module):
     """Decoder double shaped like the wheel layer's attn-res contract."""
 
-    def __init__(self, layer_idx=0, generic=False, attn_res=True):
+    def __init__(self, layer_idx=0, generic=False, attn_res=True, wrapper=None):
         super().__init__()
         self.hidden_size = 8
         self.use_attn_residuals = attn_res
-        wrapper = _FakeGenericMLAWrapper() if generic else _FakeKimiK3MLAWrapper()
+        if wrapper is None:
+            wrapper = (
+                _FakeGenericMLAWrapper() if generic else _FakeKimiK3MLAWrapper()
+            )
         self.self_attn = _FakeKimiMLAAttention(wrapper)
         self.input_layernorm = _FakeRMSNorm(8)
         self.post_attention_layernorm = _FakeRMSNorm(8)
@@ -205,7 +269,7 @@ def _fake_target():
 def _enable_hcu(monkeypatch, fused=True):
     monkeypatch.setattr(henvs, "custom_ops_enabled", lambda: True)
     monkeypatch.setattr(henvs, "k3_sp_moe_enabled", lambda: False)
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_FUSED_RMS_QUANT", fused)
+    monkeypatch.setattr(henvs, "fused_rms_quant_enabled", lambda: fused)
 
 
 def test_fused_rms_quant_disabled_keeps_plain_norm(monkeypatch, fake_moe_runner):
@@ -256,7 +320,9 @@ def test_fused_rms_quant_swaps_norm_and_threads_prequant(monkeypatch, fake_moe_r
     assert prefix.shape == (3, 8)
 
 
-def test_fused_rms_quant_skips_dsa_and_generic_wrapper(monkeypatch, fake_moe_runner):
+def test_fused_rms_quant_skips_dsa_and_generic_wrapper(
+    monkeypatch, fake_moe_runner, fake_k31_module
+):
     _enable_hcu(monkeypatch, fused=True)
     monkeypatch.setattr(
         "vllm_hcu.ops.fuse_rms_norm_quant.FusedRMSNormAndQuant",
@@ -265,10 +331,52 @@ def test_fused_rms_quant_skips_dsa_and_generic_wrapper(monkeypatch, fake_moe_run
     target = _fake_target()
     assert patch_kimi_k3_reference_paths.apply_to_module(target)
 
-    # DSA layer: same stock attention class but generic wrapper instance.
+    # DSA layer whose wrapper is the PLAIN generic class: the isinstance
+    # whitelist must still reject it even with the fusion env enabled.
     dsa_layer = target.KimiDecoderLayer(generic=True)
     assert isinstance(dsa_layer.input_layernorm, _FakeRMSNorm)
     assert not getattr(dsa_layer, "_hcu_fused_rms_quant", False)
+
+
+def test_fused_rms_quant_dsa_subclass_threads_prequant(
+    monkeypatch, fake_moe_runner, fake_k31_module
+):
+    _enable_hcu(monkeypatch, fused=True)
+    monkeypatch.setattr(
+        "vllm_hcu.ops.fuse_rms_norm_quant.FusedRMSNormAndQuant",
+        _FakeFusedRMSNormAndQuant,
+    )
+    target = _fake_target()
+    assert patch_kimi_k3_reference_paths.apply_to_module(target)
+
+    dsa_layer = target.KimiDecoderLayer(wrapper=_FakeK31FusedMLAWrapper())
+    assert isinstance(dsa_layer.input_layernorm, _FakeFusedRMSNormAndQuant)
+    assert dsa_layer._hcu_fused_rms_quant is True
+
+    wrapper = dsa_layer.self_attn.mla_attn
+    prefix, _ = dsa_layer.forward_attn_residual(
+        torch.zeros(3, dtype=torch.long), torch.ones(3, 8), torch.zeros(2, 3, 8)
+    )
+    # The fused pair reached the DSA wrapper through the explicit kwarg and
+    # hit the fused QKV projection exactly once.
+    last = wrapper.forward_kwargs[-1]
+    assert last["x_and_scale_quanted"] is not None
+    assert wrapper.fused_qkv_a_proj.prequant_calls == 1
+    assert prefix.shape == (3, 8)
+
+
+def test_envs_fused_rms_quant_gate_truth_table(monkeypatch):
+    monkeypatch.delenv("VLLM_HCU_USE_FUSED_RMS_QUANT", raising=False)
+    monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_OPS", raising=False)
+    assert henvs.fused_rms_quant_enabled() is False
+    monkeypatch.setenv("VLLM_HCU_USE_FUSED_RMS_QUANT", "1")
+    assert henvs.fused_rms_quant_enabled() is True
+    # master switch off => gate off regardless of the child switch
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    assert henvs.fused_rms_quant_enabled() is False
+    monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_OPS", raising=False)
+    monkeypatch.setenv("VLLM_HCU_USE_FUSED_RMS_QUANT", "False")
+    assert henvs.fused_rms_quant_enabled() is False
 
 
 def test_fused_rms_quant_skips_plain_residual_layers(monkeypatch, fake_moe_runner):
@@ -298,14 +406,15 @@ def test_fused_rms_quant_respects_env_gates(monkeypatch, fake_moe_runner):
     layer = target.KimiDecoderLayer()
     assert isinstance(layer.input_layernorm, _FakeFusedRMSNormAndQuant)
 
-    # custom-ops gate off: plain norm stays.
-    monkeypatch.setattr(henvs, "custom_ops_enabled", lambda: False)
+    # combined gate off (master switch closed): plain norm stays.
+    monkeypatch.setattr(henvs, "fused_rms_quant_enabled", lambda: False)
     layer_no_ops = target.KimiDecoderLayer()
     assert isinstance(layer_no_ops.input_layernorm, _FakeRMSNorm)
 
     # SP-MoE on: the input-norm fusion only touches the attention side, so
-    # it stays enabled (the MoE-side post_attention_layernorm is not fused).
-    monkeypatch.setattr(henvs, "custom_ops_enabled", lambda: True)
+    # it stays enabled (the MoE-side post_attention_layernorm is not fused;
+    # the SP forward threads the pair through _run_self_attn itself).
+    monkeypatch.setattr(henvs, "fused_rms_quant_enabled", lambda: True)
     monkeypatch.setattr(henvs, "k3_sp_moe_enabled", lambda: True)
     layer_sp = target.KimiDecoderLayer()
     assert isinstance(layer_sp.input_layernorm, _FakeFusedRMSNormAndQuant)
@@ -318,3 +427,113 @@ def test_decode_clean_logits_flag_lazy_resolution(monkeypatch):
     assert henvs.VLLM_HCU_INDEXER_DECODE_CLEAN_LOGITS is True
     monkeypatch.setenv("VLLM_HCU_INDEXER_DECODE_CLEAN_LOGITS", "0")
     assert henvs.VLLM_HCU_INDEXER_DECODE_CLEAN_LOGITS is False
+
+
+# ---------------------------------------------------------------------------
+# The real KimiK31FusedQuantMLAWrapper (audited forward clone + drift guard).
+# These tests import the actual kimi_k31 model module.
+# ---------------------------------------------------------------------------
+
+
+class _CallableMLA:
+    """Upstream's self.mla_attn is a callable MLAAttention module."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, q, kv_c_normed, k_pe, output_shape=None,
+                 q_dcp_replicated=None):
+        self.calls += 1
+        assert output_shape is not None
+        return torch.zeros(output_shape)
+
+
+def _build_real_k31_wrapper():
+    from vllm_hcu.models.kimi_k31 import KimiK31FusedQuantMLAWrapper
+
+    wrapper = object.__new__(KimiK31FusedQuantMLAWrapper)
+    # The real __init__ needs a full MLAModules stack; bypass it and bring
+    # up the nn.Module machinery explicitly so submodule assignment works
+    # (same transplant pattern KimiK31DSAAttention uses on foreign
+    # instances).
+    nn.Module.__init__(wrapper)
+    wrapper.q_lora_rank = 4
+    wrapper.kv_lora_rank = 4
+    wrapper.qk_rope_head_dim = 1
+    wrapper.qk_head_dim = 5
+    wrapper.qk_nope_head_dim = 4
+    wrapper.v_head_dim = 1
+    wrapper.num_heads = 2
+    wrapper.fused_qkv_a_proj = _FakeLinear(8, 9)
+    wrapper.q_a_layernorm = _FakeRMSNorm(4)
+    wrapper.q_b_proj = _FakeLinear(4, 10)
+    wrapper.kv_a_layernorm = _FakeRMSNorm(4)
+    wrapper.o_proj = _FakeLinear(2, 8)
+    wrapper.rotary_emb = None
+    wrapper.indexer = None
+    wrapper.indexer_rope_emb = None
+    wrapper.is_sparse = True
+    wrapper.skip_topk = False
+    wrapper.fuse_qkv_rmsnorm = False
+    wrapper.dcp_q_replicate = False
+    wrapper.g_proj = None
+    wrapper.mla_attn = _CallableMLA()
+    return wrapper
+
+
+def test_real_k31_fused_wrapper_threads_pair_and_hits_proj_once():
+    wrapper = _build_real_k31_wrapper()
+    hidden = torch.randn(3, 8)
+    pair = (
+        torch.zeros(3, 8, dtype=torch.int8),
+        torch.full((3, 1), 0.5),
+    )
+    out = wrapper.forward(
+        torch.zeros(3, dtype=torch.long), hidden, x_and_scale_quanted=pair
+    )
+    assert wrapper.fused_qkv_a_proj.prequant_calls == 1
+    assert wrapper.mla_attn.calls == 1
+    assert out.shape == (3, 8)
+
+
+def test_real_k31_fused_wrapper_falls_back_without_pair():
+    wrapper = _build_real_k31_wrapper()
+    hidden = torch.randn(3, 8)
+    # No pair: pure upstream behavior (the upstream forward runs our fakes
+    # fine -- bare proj call, same splits, same attention call).
+    out = wrapper.forward(torch.zeros(3, dtype=torch.long), hidden)
+    assert wrapper.fused_qkv_a_proj.prequant_calls == 0
+    assert out.shape == (3, 8)
+
+
+@pytest.fixture
+def _reset_signature_guard():
+    from vllm_hcu.models import kimi_k31
+
+    kimi_k31._upstream_mla_forward_verified = False
+    yield
+    kimi_k31._upstream_mla_forward_verified = True
+
+
+def test_real_k31_signature_guard_passes_pinned_upstream(_reset_signature_guard):
+    from vllm_hcu.models import kimi_k31
+
+    kimi_k31._verify_upstream_mla_forward_once()
+    assert kimi_k31._upstream_mla_forward_verified is True
+
+
+def test_real_k31_signature_guard_rejects_upstream_drift(
+    monkeypatch, _reset_signature_guard
+):
+    from vllm_hcu.models import kimi_k31
+
+    class _DriftedUpstream(nn.Module):
+        def forward(self, positions, hidden_states, new_required_arg):
+            raise AssertionError("drifted upstream must never run")
+
+    monkeypatch.setattr(
+        kimi_k31, "MultiHeadLatentAttentionWrapper", _DriftedUpstream
+    )
+    with pytest.raises(RuntimeError, match="signature changed"):
+        kimi_k31._verify_upstream_mla_forward_once()
+    assert kimi_k31._upstream_mla_forward_verified is False

@@ -230,18 +230,18 @@ def apply_to_module(module: ModuleType) -> bool:
     def _enable_fused_rms_quant(layer) -> None:
         """Swap the QKV-feeding norms for FusedRMSNormAndQuant in place.
 
-        Only dense K3 MLA layers qualify: the K3.1 DSA layers route through
-        the generic ``MultiHeadLatentAttentionWrapper``, whose forward does
-        not accept a prequantized pair, and KDA layers have no MLA QKV
-        projection. The RMSNorm weight Parameter object is shared with the
-        fused module, so ``load_weights`` keeps populating the same storage.
-        The swap is limited to attn-res blocks (K3.1 Pro), whose HCU
-        ``forward_attn_residual`` consumes the fused pair; the plain
-        ``forward`` residual path keeps its 2-tuple RMSNorm contract.
+        Two wrapper families qualify, both explicit-kwarg consumers: the
+        audited dense K3 MLA wrapper, and the K3.1 DSA fused wrapper
+        subclass (an env-gated construction-site choice in kimi_k31 that
+        accepts the pair via ``_forward_with_hcu_quanted``). KDA layers
+        have no MLA QKV projection. The RMSNorm weight Parameter object is
+        shared with the fused module, so ``load_weights`` keeps populating
+        the same storage. The swap is limited to attn-res blocks (K3.1
+        Pro), whose HCU ``forward_attn_residual`` consumes the fused pair;
+        the plain ``forward`` residual path keeps its 2-tuple RMSNorm
+        contract.
         """
-        if not (
-            henvs.VLLM_HCU_USE_FUSED_RMS_QUANT and henvs.custom_ops_enabled()
-        ):
+        if not henvs.fused_rms_quant_enabled():
             return
         if not getattr(layer, "use_attn_residuals", False):
             return
@@ -249,8 +249,16 @@ def apply_to_module(module: ModuleType) -> bool:
         attention = getattr(layer, "self_attn", None)
         if attention_cls is None or not isinstance(attention, attention_cls):
             return
+        mla_wrapper = getattr(attention, "mla_attn", None)
+        # Lazy import: the K3.1 model module drags the full vllm model stack,
+        # which this patch context must not require for plain K3 serves.
+        from vllm_hcu.models.kimi_k31 import KimiK31FusedQuantMLAWrapper
         if not isinstance(
-            getattr(attention, "mla_attn", None), target.KimiK3MultiHeadLatentAttentionWrapper
+            mla_wrapper,
+            (
+                target.KimiK3MultiHeadLatentAttentionWrapper,
+                KimiK31FusedQuantMLAWrapper,
+            ),
         ):
             return
         if getattr(attention, "q_lora_rank", None) is None:
@@ -258,11 +266,14 @@ def apply_to_module(module: ModuleType) -> bool:
         # Only input_layernorm is fused: it feeds the QKV projection, whose
         # HCU linear contract accepts the prequantized int8/scale pair.
         # post_attention_layernorm feeds the router gate (bf16) plus the MoE
-        # dispatch quant and keeps its plain RMSNorm forward — that is also
-        # why SP-MoE stays compatible: the K3 SP-MoE path replaces only the
-        # post-attention MoE side, never the attention input norm. Norm calls
-        # in ``forward_attn_residual`` and the module swap below stay in
-        # lockstep.
+        # dispatch quant and keeps its plain RMSNorm forward. The wrapper
+        # isinstance whitelist above is the compatibility fence: only
+        # wrappers whose forward explicitly consumes the pair through
+        # ``_forward_with_hcu_quanted`` may be paired with the fused norm,
+        # and the SP path threads the pair through ``_run_self_attn`` the
+        # same way (see patch_kimi_k3_sp_moe._sp_forward_attn_residual).
+        # Norm calls in ``forward_attn_residual`` and the module swap below
+        # stay in lockstep.
         norm = getattr(layer, "input_layernorm", None)
         if norm is None or isinstance(norm, FusedRMSNormAndQuant):
             return

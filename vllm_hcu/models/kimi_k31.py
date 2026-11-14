@@ -59,6 +59,7 @@ from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
 from vllm.v1.attention.selector import get_attn_backend
 
+from vllm_hcu.platforms import envs as henvs
 from vllm_hcu.platforms.hcu import on_gfx938
 
 logger = init_logger(__name__)
@@ -364,6 +365,141 @@ def _normalize_k31_kv_cache_dtype(
         )
 
 
+class KimiK31FusedQuantMLAWrapper(MultiHeadLatentAttentionWrapper):
+    """Generic MLA wrapper carrying the decoder's fused rmsnorm+quant pair.
+
+    K3.1 DSA layers route through the stock generic wrapper, whose forward
+    signature cannot carry the prequantized ``(int8, scale)`` pair produced
+    by ``FusedRMSNormAndQuant``. The fused input norm is a decoder-level,
+    env-gated decision (``_hcu_fused_rms_quant``); when enabled the DSA
+    layer constructs this subclass so the pair reaches ``fused_qkv_a_proj``
+    through the explicit ``_forward_with_hcu_quanted`` contract -- explicit
+    data flow, no hidden module state, no base-class changes.
+
+    The fused branch is an audited clone of the *deployed* upstream
+    ``forward`` (dist-packages ``vllm/model_executor/layers/mla.py``: no
+    ``skip_o_proj`` parameter, no ``record_logical_topk_ready`` hook) with
+    one substitution: the bare ``self.fused_qkv_a_proj(hidden_states)``
+    call becomes the explicit prequant call. Any feature combination the
+    audit has not covered (``fuse_qkv_rmsnorm``, ``dcp_q_replicate``, no
+    q-LoRA) falls back to the upstream implementation, which simply re-runs
+    the plain rmsnorm GEMM input path. ``skip_topk`` stays on the fused
+    path: it only deselects the indexer call, exactly as upstream.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        _verify_upstream_mla_forward_once()
+        super().__init__(*args, **kwargs)
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        llama_4_scaling: torch.Tensor | None = None,
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        if (
+            x_and_scale_quanted is None
+            or self.fuse_qkv_rmsnorm
+            or self.dcp_q_replicate
+            or self.q_lora_rank is None
+        ):
+            return super().forward(positions, hidden_states, llama_4_scaling)
+
+        assert self.fused_qkv_a_proj is not None, (
+            "fused_qkv_a_proj is required when q_lora_rank is not None"
+        )
+        assert self.q_a_layernorm is not None, (
+            "q_a_layernorm is required when q_lora_rank is not None"
+        )
+        assert self.q_b_proj is not None, (
+            "q_b_proj is required when q_lora_rank is not None"
+        )
+
+        qkv_lora = self.fused_qkv_a_proj._forward_with_hcu_quanted(
+            hidden_states,
+            x_and_scale_quanted,
+        )[0]
+        q_c, kv_lora = qkv_lora.split(
+            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+            dim=-1,
+        )
+        q_c = self.q_a_layernorm(q_c)
+
+        kv_c, k_pe = kv_lora.split(
+            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )
+        kv_c_normed = self.kv_a_layernorm(kv_c)
+        # Add head dim of 1 to k_pe
+        k_pe = k_pe.unsqueeze(1)
+
+        q = self.q_b_proj(q_c)[0]
+        q = q.view(-1, self.num_heads, self.qk_head_dim)
+
+        if self.rotary_emb is not None:
+            q[..., self.qk_nope_head_dim:], k_pe = self.rotary_emb(
+                positions, q[..., self.qk_nope_head_dim:], k_pe
+            )
+
+        if self.indexer and self.is_sparse and not self.skip_topk:
+            self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
+
+        if llama_4_scaling is not None:
+            q *= llama_4_scaling
+
+        # dcp_q_replicate is excluded above, so the replicated view is None;
+        # the call shape stays byte-identical to upstream's tail.
+        q_dcp_replicated = None
+        attn_out = self.mla_attn(
+            q,
+            kv_c_normed,
+            k_pe,
+            output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
+            q_dcp_replicated=q_dcp_replicated,
+        )
+
+        if self.g_proj is not None:
+            attn_out = attn_out * self.g_proj(hidden_states)[0].sigmoid()
+
+        return self.o_proj(attn_out)[0]
+
+
+# The fused branch clones the deployed upstream forward; a rebase that
+# changes its signature (new fields, renamed args, split-order changes)
+# must fail loudly at wrapper construction instead of silently running
+# stale math.
+_UPSTREAM_MLA_FORWARD_PARAMS = (
+    "self",
+    "positions",
+    "hidden_states",
+    "llama_4_scaling",
+)
+_upstream_mla_forward_verified = False
+
+
+def _verify_upstream_mla_forward_once() -> None:
+    """One-shot structural guard against upstream forward drift."""
+
+    global _upstream_mla_forward_verified
+    if _upstream_mla_forward_verified:
+        return
+    import inspect
+
+    params = tuple(
+        inspect.signature(MultiHeadLatentAttentionWrapper.forward).parameters
+    )
+    if params != _UPSTREAM_MLA_FORWARD_PARAMS:
+        raise RuntimeError(
+            "KimiK31FusedQuantMLAWrapper.forward is an audited clone of "
+            "vllm.model_executor.layers.mla."
+            "MultiHeadLatentAttentionWrapper.forward whose signature "
+            f"changed: {params} != {_UPSTREAM_MLA_FORWARD_PARAMS}. "
+            "Re-audit the clone before enabling the fused rmsnorm+quant "
+            "path on K3.1 DSA layers."
+        )
+    _upstream_mla_forward_verified = True
+
+
 class KimiK31DSAAttention:
     """Kimi-K3.1 DSA full-attention state (sparse MLA + inline indexer).
 
@@ -611,7 +747,16 @@ class KimiK31DSAAttention:
             g_proj=getattr(self, "g_proj", None),
         )
         # The plain wrapper, not the AMD Kimi wrapper: see module docstring.
-        self.mla_attn = MultiHeadLatentAttentionWrapper(
+        # Env-gated fused rmsnorm+quant swaps in the audited subclass so the
+        # decoder's FusedRMSNormAndQuant pair reaches fused_qkv_a_proj via
+        # the explicit kwarg; the default path stays type-identical to stock
+        # (the fused class only ever constructs under the gate).
+        wrapper_cls = (
+            KimiK31FusedQuantMLAWrapper
+            if henvs.fused_rms_quant_enabled()
+            else MultiHeadLatentAttentionWrapper
+        )
+        self.mla_attn = wrapper_cls(
             self.hidden_size,
             self.num_local_heads,
             self.scaling,
