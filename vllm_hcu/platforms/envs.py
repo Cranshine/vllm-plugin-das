@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_LIGHTOP_AWQ: bool = False
     VLLM_HCU_INDEXER_KCACHE_LAYOUT: str = "preshuffle"
     VLLM_HCU_INDEXER_SCORER: str = "lightop"
+    VLLM_HCU_INDEXER_DECODE_CLEAN_LOGITS: bool = False
     VLLM_HCU_USE_LIGHTOP_MLA_DECODE_CAT: bool = True
     VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D : bool = False
     VLLM_HCU_USE_DP_CONNECTOR : bool = False
@@ -835,6 +836,17 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # block-padded pages), or "aiter" (fp8 MMAC, dense pages only).
     "VLLM_HCU_INDEXER_SCORER":
         indexer_scorer,
+
+    # gfx938 sparse-indexer decode scoring: keep the scorer's internal
+    # invalid-position cleanup pass (a full-logits clamp per indexer call,
+    # ~1ms per call at max context). HCU decode consumers only read
+    # [0, row_end) via row-bounded top-k and gather already-selected
+    # positions in the DCP merge, so the pass is redundant; default False
+    # skips it (deepgemm/aiter receive clean_logits=False). Set True to
+    # restore per-call cleaning.
+    "VLLM_HCU_INDEXER_DECODE_CLEAN_LOGITS":
+        lambda: (os.environ.get("VLLM_HCU_INDEXER_DECODE_CLEAN_LOGITS", "False").lower()
+                 in ("true", "1")),
 
     # Route the RMSNorm applied after the mHC pre/fused-post-pre kernels
     # through aten's single fused rms_norm kernel instead of

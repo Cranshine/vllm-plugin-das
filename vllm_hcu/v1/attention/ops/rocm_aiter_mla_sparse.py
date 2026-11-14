@@ -1064,6 +1064,11 @@ def rocm_fp8_paged_mqa_logits(
                         "gfx938 normal-layout sparse-indexer decode "
                         "scoring: using deepgemm paged_mqa_logits"
                     )
+                    # clean_logits=False skips the scorer's internal
+                    # full-logit clamp pass. All HCU decode consumers are
+                    # row-bounded (top-k reads [0, row_end) derived from the
+                    # same context lens) or gather already-selected columns
+                    # (DCP merge), so uncleaned tail values are never read.
                     return deepgemm_paged_mqa_logits(
                         q_fp8,
                         kv_cache_fp8,
@@ -1071,7 +1076,7 @@ def rocm_fp8_paged_mqa_logits(
                         context_lens,
                         block_tables,
                         max_model_len,
-                        clean_logits=True,
+                        clean_logits=henvs.VLLM_HCU_INDEXER_DECODE_CLEAN_LOGITS,
                     )
                 logger.warning_once(
                     "VLLM_HCU_INDEXER_SCORER=deepgemm: deepgemm "
@@ -1106,7 +1111,7 @@ def rocm_fp8_paged_mqa_logits(
                         context_lens,
                         block_tables,
                         max_model_len,
-                        clean_logits=True,
+                        clean_logits=henvs.VLLM_HCU_INDEXER_DECODE_CLEAN_LOGITS,
                     )
                 logger.warning_once(
                     "VLLM_HCU_INDEXER_SCORER=aiter: aiter paged_mqa_logits "
