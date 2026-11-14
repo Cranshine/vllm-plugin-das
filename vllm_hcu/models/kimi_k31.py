@@ -403,6 +403,17 @@ class KimiK31FusedQuantMLAWrapper(MultiHeadLatentAttentionWrapper):
             or self.fuse_qkv_rmsnorm
             or self.dcp_q_replicate
             or self.q_lora_rank is None
+            # worker.op_opt.mla.lightly_cp_wrapper replaces THIS base class's
+            # forward with a dispatcher that all-gathers kv_c_normed/k_pe
+            # across ranks under Lightly-CP. The fast path below is single-
+            # rank math; on a CP-enabled instance it would silently skip the
+            # gather, so those instances stay on the patched base forward,
+            # which simply re-runs the plain rmsnorm GEMM input path.
+            or getattr(
+                getattr(self, "_hcu_feature_config", None),
+                "enable_lightly_cp",
+                False,
+            )
         ):
             return super().forward(positions, hidden_states, llama_4_scaling)
 

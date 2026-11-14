@@ -506,13 +506,41 @@ def test_real_k31_fused_wrapper_falls_back_without_pair():
     assert out.shape == (3, 8)
 
 
+def test_real_k31_fused_wrapper_falls_back_on_lightly_cp(monkeypatch):
+    """Lightly-CP instances must never take the single-rank fast path.
+
+    worker.op_opt.mla.lightly_cp_wrapper rewrites the base class forward to
+    all-gather kv_c_normed/k_pe under CP; the fused fast path has no such
+    gather, so a CP-enabled wrapper must fall back to the patched base
+    forward (dropping the pair) even when the decoder supplies one.
+    """
+    from types import SimpleNamespace
+
+    wrapper = _build_real_k31_wrapper()
+    wrapper._hcu_feature_config = SimpleNamespace(enable_lightly_cp=True)
+    hidden = torch.randn(3, 8)
+    pair = (
+        torch.zeros(3, 8, dtype=torch.int8),
+        torch.full((3, 1), 0.5),
+    )
+    out = wrapper.forward(
+        torch.zeros(3, dtype=torch.long), hidden, x_and_scale_quanted=pair
+    )
+    # Fast path skipped: the pair never reached the QKV projection.
+    assert wrapper.fused_qkv_a_proj.prequant_calls == 0
+    assert out.shape == (3, 8)
+
+
 @pytest.fixture
 def _reset_signature_guard():
     from vllm_hcu.models import kimi_k31
 
+    original = kimi_k31._upstream_mla_forward_verified
     kimi_k31._upstream_mla_forward_verified = False
     yield
-    kimi_k31._upstream_mla_forward_verified = True
+    # Restore the pre-test truth: hardcoding True here would mask a real
+    # signature drift for every later consumer in the same process.
+    kimi_k31._upstream_mla_forward_verified = original
 
 
 def test_real_k31_signature_guard_passes_pinned_upstream(_reset_signature_guard):
