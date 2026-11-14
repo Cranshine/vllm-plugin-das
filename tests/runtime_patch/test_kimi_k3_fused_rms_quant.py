@@ -49,18 +49,10 @@ class _FakeLinear(nn.Module):
         self.out_features = out_features
         self.weight = nn.Parameter(torch.zeros(out_features, in_features))
         self.prequant_calls = 0
-        self.last_pair_used = None
-
-    def take_pinned_quanted(self):
-        # Mirrors LinearBase.take_pinned_quanted: consume a pending pin.
-        return self.__dict__.pop("_hcu_next_quanted", None)
 
     def _forward_with_hcu_quanted(self, x, x_and_scale_quanted):
-        if x_and_scale_quanted is None:
-            x_and_scale_quanted = self.take_pinned_quanted()
         if x_and_scale_quanted is not None:
             self.prequant_calls += 1
-            self.last_pair_used = x_and_scale_quanted
         return x @ self.weight.t(), None
 
     def forward(self, x):
@@ -130,21 +122,12 @@ class _FakeKimiK3MLAWrapper(nn.Module):
 
 
 class _FakeGenericMLAWrapper(nn.Module):
-    """Stock generic MLA wrapper double (K3.1 DSA layers route here).
-
-    The real forward signature stays ``(positions, hidden_states)`` — the
-    pinned prequant pair is consumed by its bare projection call.
-    """
-
-    def __init__(self, hidden_size=8, with_proj=True):
-        super().__init__()
-        self.fused_qkv_a_proj = _FakeLinear(hidden_size, hidden_size) \
-            if with_proj else None
+    """Stand-in for the generic wrapper DSA layers route through."""
 
     def forward(self, positions, hidden_states, *args, **kwargs):
-        assert not kwargs, "generic wrapper must not receive prequant kwargs"
-        assert self.fused_qkv_a_proj is not None
-        return self.fused_qkv_a_proj(hidden_states)[0]
+        raise AssertionError(
+            "DSA layers must not receive the fused prequant argument"
+        )
 
 
 class _FakeKimiMLAAttention(nn.Module):
@@ -152,10 +135,6 @@ class _FakeKimiMLAAttention(nn.Module):
         super().__init__()
         self.q_lora_rank = 4
         self.mla_attn = mla_attn
-
-    def forward(self, positions, hidden_states, output,
-                x_and_scale_quanted=None):
-        output[:] = self.mla_attn(positions, hidden_states)
 
 
 class _FakeKimiMoE(nn.Module):
@@ -176,15 +155,11 @@ class _FakeKimiRoutedOutputTransform(nn.Module):
 class _FakeKimiDecoderLayer(nn.Module):
     """Decoder double shaped like the wheel layer's attn-res contract."""
 
-    def __init__(self, layer_idx=0, generic=False, attn_res=True,
-                 proj_less=False):
+    def __init__(self, layer_idx=0, generic=False, attn_res=True):
         super().__init__()
         self.hidden_size = 8
         self.use_attn_residuals = attn_res
-        if generic:
-            wrapper = _FakeGenericMLAWrapper(with_proj=not proj_less)
-        else:
-            wrapper = _FakeKimiK3MLAWrapper()
+        wrapper = _FakeGenericMLAWrapper() if generic else _FakeKimiK3MLAWrapper()
         self.self_attn = _FakeKimiMLAAttention(wrapper)
         self.input_layernorm = _FakeRMSNorm(8)
         self.post_attention_layernorm = _FakeRMSNorm(8)
@@ -281,9 +256,7 @@ def test_fused_rms_quant_swaps_norm_and_threads_prequant(monkeypatch, fake_moe_r
     assert prefix.shape == (3, 8)
 
 
-def test_fused_rms_quant_dsa_pins_pair_through_generic_wrapper(
-    monkeypatch, fake_moe_runner
-):
+def test_fused_rms_quant_skips_dsa_and_generic_wrapper(monkeypatch, fake_moe_runner):
     _enable_hcu(monkeypatch, fused=True)
     monkeypatch.setattr(
         "vllm_hcu.ops.fuse_rms_norm_quant.FusedRMSNormAndQuant",
@@ -292,41 +265,10 @@ def test_fused_rms_quant_dsa_pins_pair_through_generic_wrapper(
     target = _fake_target()
     assert patch_kimi_k3_reference_paths.apply_to_module(target)
 
-    # DSA layer: same stock attention class, generic wrapper instance — the
-    # fused norm still installs, and the pair travels pinned on the target
-    # projection because the generic wrapper forward takes no prequant arg.
+    # DSA layer: same stock attention class but generic wrapper instance.
     dsa_layer = target.KimiDecoderLayer(generic=True)
-    assert isinstance(dsa_layer.input_layernorm, _FakeFusedRMSNormAndQuant)
-    assert dsa_layer._hcu_fused_rms_quant is True
-    assert dsa_layer._hcu_prequant_via_pin is True
-
-    wrapper = dsa_layer.self_attn.mla_attn
-    x = torch.ones(3, 8)
-    dsa_layer.forward_attn_residual(
-        torch.zeros(3, dtype=torch.long), x, torch.zeros(2, 3, 8)
-    )
-    proj = wrapper.fused_qkv_a_proj
-    assert proj.prequant_calls == 1
-    assert proj.last_pair_used is not None
-    assert proj.last_pair_used[0].dtype == torch.int8
-    assert "_hcu_next_quanted" not in proj.__dict__
-
-
-def test_fused_rms_quant_skips_wrapper_without_hcu_proj(
-    monkeypatch, fake_moe_runner
-):
-    _enable_hcu(monkeypatch, fused=True)
-    monkeypatch.setattr(
-        "vllm_hcu.ops.fuse_rms_norm_quant.FusedRMSNormAndQuant",
-        _FakeFusedRMSNormAndQuant,
-    )
-    target = _fake_target()
-    assert patch_kimi_k3_reference_paths.apply_to_module(target)
-
-    # Generic wrapper with no HCU projection cannot carry the pinned pair.
-    layer = target.KimiDecoderLayer(generic=True, proj_less=True)
-    assert isinstance(layer.input_layernorm, _FakeRMSNorm)
-    assert not getattr(layer, "_hcu_fused_rms_quant", False)
+    assert isinstance(dsa_layer.input_layernorm, _FakeRMSNorm)
+    assert not getattr(dsa_layer, "_hcu_fused_rms_quant", False)
 
 
 def test_fused_rms_quant_skips_plain_residual_layers(monkeypatch, fake_moe_runner):

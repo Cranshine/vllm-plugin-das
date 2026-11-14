@@ -445,26 +445,11 @@ class ReplicatedLinear(LinearBase):
         )
         param.data.copy_(loaded_weight)
 
-    def take_pinned_quanted(self) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Consume a decoder-pinned prequant pair, if one is pending.
-
-        The K3 decoder's fused rmsnorm+quant path pins the (int8, scale)
-        pair on the target projection (``_hcu_next_quanted``) right before
-        the bare ``proj(hidden)`` call made by attention wrappers whose
-        forward signature cannot carry the extra argument (the stock K3.1
-        DSA generic MLA wrapper). The next call on the same projection
-        consumes the pin; every other caller is unaffected. Explicit
-        ``x_and_scale_quanted`` arguments always win over a pin.
-        """
-        return self.__dict__.pop("_hcu_next_quanted", None)
-
     def _forward_with_hcu_quanted(
         self,
         x: torch.Tensor,
         x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None,
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
-        if x_and_scale_quanted is None:
-            x_and_scale_quanted = self.take_pinned_quanted()
         bias = self.bias if not self.skip_bias_add else None
 
         if x_and_scale_quanted is not None \
@@ -682,8 +667,6 @@ class ColumnParallelLinear(LinearBase):
         input_,
         x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None,
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
-        if x_and_scale_quanted is None:
-            x_and_scale_quanted = self.take_pinned_quanted()
         bias = self.bias if not self.skip_bias_add else None
 
         # Matrix multiply.
@@ -1997,8 +1980,6 @@ class RowParallelLinear(LinearBase):
         input_,
         x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None,
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
-        if x_and_scale_quanted is None:
-            x_and_scale_quanted = self.take_pinned_quanted()
         if self.input_is_parallel:
             input_parallel = input_
         else:
