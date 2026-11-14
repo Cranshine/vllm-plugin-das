@@ -303,11 +303,12 @@ def test_fused_rms_quant_respects_env_gates(monkeypatch, fake_moe_runner):
     layer_no_ops = target.KimiDecoderLayer()
     assert isinstance(layer_no_ops.input_layernorm, _FakeRMSNorm)
 
-    # SP-MoE gate on: fusion stays off even with custom ops.
+    # SP-MoE on: the input-norm fusion only touches the attention side, so
+    # it stays enabled (the MoE-side post_attention_layernorm is not fused).
     monkeypatch.setattr(henvs, "custom_ops_enabled", lambda: True)
     monkeypatch.setattr(henvs, "k3_sp_moe_enabled", lambda: True)
     layer_sp = target.KimiDecoderLayer()
-    assert isinstance(layer_sp.input_layernorm, _FakeRMSNorm)
+    assert isinstance(layer_sp.input_layernorm, _FakeFusedRMSNormAndQuant)
 
 
 def test_decode_clean_logits_flag_lazy_resolution(monkeypatch):

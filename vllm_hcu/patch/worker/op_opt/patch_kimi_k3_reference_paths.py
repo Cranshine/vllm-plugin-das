@@ -240,9 +240,7 @@ def apply_to_module(module: ModuleType) -> bool:
         ``forward`` residual path keeps its 2-tuple RMSNorm contract.
         """
         if not (
-            henvs.VLLM_HCU_USE_FUSED_RMS_QUANT
-            and henvs.custom_ops_enabled()
-            and not henvs.k3_sp_moe_enabled()
+            henvs.VLLM_HCU_USE_FUSED_RMS_QUANT and henvs.custom_ops_enabled()
         ):
             return
         if not getattr(layer, "use_attn_residuals", False):
@@ -260,8 +258,11 @@ def apply_to_module(module: ModuleType) -> bool:
         # Only input_layernorm is fused: it feeds the QKV projection, whose
         # HCU linear contract accepts the prequantized int8/scale pair.
         # post_attention_layernorm feeds the router gate (bf16) plus the MoE
-        # dispatch quant and keeps its plain RMSNorm forward. Norm calls in
-        # ``forward_attn_residual`` and the module swap below stay in lockstep.
+        # dispatch quant and keeps its plain RMSNorm forward — that is also
+        # why SP-MoE stays compatible: the K3 SP-MoE path replaces only the
+        # post-attention MoE side, never the attention input norm. Norm calls
+        # in ``forward_attn_residual`` and the module swap below stay in
+        # lockstep.
         norm = getattr(layer, "input_layernorm", None)
         if norm is None or isinstance(norm, FusedRMSNormAndQuant):
             return
