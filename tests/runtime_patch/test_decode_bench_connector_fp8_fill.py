@@ -458,6 +458,168 @@ def test_non_contiguous_view_written_in_place_real_chain():
     assert base[1].sum().item() == 0 and base[3].sum().item() == 0
 
 
+# --------------------------------------------- broadcast write / id fastpath ---
+
+
+def test_contiguous_range_fill_matches_reference_bytes():
+    """Contiguous ids take the arange fast path and must land the same bytes
+    as the explicit list path (2026-11-16 TTFT cut: no python-list round
+    trip on the scheduler's dense ranges)."""
+    connector, _ = _load_patched_connector()
+    layers = ["l0"]
+    groups = _groups_from([[_LayerSpec("fp8_e4m3")]], [layers])
+    fast = torch.zeros((6, 8), dtype=torch.uint8)
+    slow = torch.zeros((6, 8), dtype=torch.uint8)
+    w = _make_worker(connector, "fp8_e4m3", groups,
+                     {"l0": fast, "l1": slow})
+    w._fill_blocks(0, [1, 2, 3, 4], 32)          # dense range -> arange path
+    w.kv_caches["l0"] = slow
+    w._fill_blocks(0, [1, 3, 4], 24)             # sparse -> tensor fallback
+    assert (fast[1:5] == 0x08).all()
+    assert (slow[[1, 3, 4]] == 0x08).all()
+    assert fast[0].sum().item() == 0 and slow[2].sum().item() == 0
+
+
+def test_int8_const_broadcast_wraps_bit_exact():
+    connector, _ = _load_patched_connector()
+    layers = ["l0"]
+    groups = _groups_from([[_LayerSpec("fp8_e4m3")]], [layers])
+    c8 = torch.zeros((3, 8), dtype=torch.int8)
+    w = _make_worker(connector, "fp8_e4m3", groups, {"l0": c8},
+                     fill_mean=-0.02)
+    w._fill_blocks(0, [0, 1], 16)
+    ref = int(torch.tensor([-0.02], dtype=torch.float32).to(FN)
+              .view(torch.uint8)[0])
+    ref_signed = torch.tensor([ref], dtype=torch.uint8).view(torch.int8)[0].item()
+    assert set(c8[0].tolist()) == {ref_signed}
+    assert set(c8[1].tolist()) == {ref_signed}
+    assert c8[2].abs().sum().item() == 0
+
+
+def test_ds_mla_fill_expanded_rows_match_per_row_write():
+    """The ds_mla fill must equal the historical per-matrix write
+    byte-for-byte (one 656B pattern row per selected block, 2-D cache)."""
+    connector, _ = _load_patched_connector()
+    spec = types.SimpleNamespace(
+        cache_dtype_str="fp8_ds_mla",
+        block_size=1,
+        page_size_bytes=656,
+    )
+    groups = _groups_from([[spec]], [["l_mla"]])
+    wide = torch.zeros((4, 656), dtype=torch.uint8)
+    w = _make_worker(connector, "fp8_ds_mla", groups, {"l_mla": wide})
+    w._fill_blocks(0, [0, 1, 2], 16)
+    row = wide[0]
+    assert wide[1].tolist() == row.tolist()
+    assert wide[2].tolist() == row.tolist()
+    assert row[0:128].view(FN).float()[0].item() == 0.015625
+    assert wide[3].sum().item() == 0
+
+
+def test_ds_mla_3d_cache_row_broadcast():
+    """A (num_blocks, block_size, 656) ds_mla cache must fill every sub-row
+    of the selected blocks with the same pattern (Claude review Q1: the 1-D
+    row broadcast covers 3-D storage; an (n, 656) value would not)."""
+    connector, _ = _load_patched_connector()
+    spec = types.SimpleNamespace(
+        cache_dtype_str="fp8_ds_mla",
+        block_size=2,
+        page_size_bytes=2 * 656,
+    )
+    groups = _groups_from([[spec]], [["l_mla"]])
+    wide = torch.zeros((3, 2, 656), dtype=torch.uint8)
+    w = _make_worker(connector, "fp8_ds_mla", groups, {"l_mla": wide})
+    w._fill_blocks(0, [1], 16)
+    pattern = wide[1, 0]
+    assert wide[1, 1].tolist() == pattern.tolist()
+    assert pattern[0:128].view(FN).float()[0].item() == 0.015625
+    assert wide[0].sum().item() == 0 and wide[2].sum().item() == 0
+
+
+def test_block_ids_helper_range_keeps_step():
+    """_block_ids_to_device: a range keeps its step; dense lists take the
+    arange path with identical values; sparse lists fall back unchanged."""
+    connector, patch = _load_patched_connector()
+    ids = patch._block_ids_to_device(range(2, 10, 2), torch.device("cpu"))
+    assert ids.tolist() == [2, 4, 6, 8]
+    dense = patch._block_ids_to_device([3, 4, 5], torch.device("cpu"))
+    assert dense.tolist() == [3, 4, 5]
+    sparse = patch._block_ids_to_device([3, 7], torch.device("cpu"))
+    assert sparse.tolist() == [3, 7]
+    single = patch._block_ids_to_device([9], torch.device("cpu"))
+    assert single.tolist() == [9]
+
+
+# ------------------------------------------------------------- async gate ---
+
+
+def test_async_fill_gate_full_loop(monkeypatch):
+    """The async loop is ON by default: matched tokens flip to the async
+    contract, the worker records request ids whose fill payload was
+    submitted, and facade get_finished drains them as finished_recving.
+    Setting the env to 0 keeps the legacy synchronous upstream semantics."""
+    connector, patch = _load_patched_connector()
+    facade = connector.DecodeBenchConnector
+    worker_cls = connector.DecodeBenchConnectorWorker
+
+    def _unwrap(cls, attr):
+        cur = getattr(cls, attr)
+        if getattr(cur, patch._WRAPPER_FLAG, False):
+            setattr(cls, attr, getattr(cur, "__wrapped__", cur))
+
+    try:
+        # strip any wrapper a previous test left on the shared classes so
+        # the kill-switch probe sees the true upstream methods
+        _unwrap(facade, "get_num_new_matched_tokens")
+        _unwrap(facade, "get_finished")
+        _unwrap(worker_cls, "start_fill_kv")
+        orig_matched = getattr(facade, "get_num_new_matched_tokens")
+        orig_finished = getattr(facade, "get_finished")
+        orig_start_fill = getattr(worker_cls, "start_fill_kv")
+        request = types.SimpleNamespace(request_id="r1", num_tokens=1024)
+        sched = types.SimpleNamespace(_filled_requests=set())
+        # bind the REAL scheduler-side implementation onto the stub
+        sched.get_num_new_matched_tokens = (
+            connector.DecodeBenchConnectorScheduler
+            .get_num_new_matched_tokens.__get__(sched)
+        )
+        inst = types.SimpleNamespace(
+            connector_scheduler=sched, _filled_requests=set())
+        # legacy sync semantics only when the kill-switch env is 0
+        monkeypatch.setenv(patch._ASYNC_FILL_ENV, "0")
+        facade.get_num_new_matched_tokens = orig_matched
+        n, is_async = facade.get_num_new_matched_tokens(inst, request, 0)
+        assert (n, is_async) == (1023, False)
+
+        monkeypatch.delenv(patch._ASYNC_FILL_ENV, raising=False)
+        patch._apply(importlib.import_module(patch.TARGET_MODULE))
+        n, is_async = facade.get_num_new_matched_tokens(inst, request, 0)
+        assert (n, is_async) == (1023, True)
+
+        # the worker wrapper records the fill, the facade drains it once
+        layers = ["l0"]
+        groups = _groups_from([[_LayerSpec("fp8_e4m3")]], [layers])
+        cache = torch.zeros((4, 8), dtype=torch.uint8)
+        w = _make_worker(connector, "fp8_e4m3", groups, {"l0": cache})
+        meta = types.SimpleNamespace(reqs_to_fill={"r9": ([[1]], 8)})
+        w.start_fill_kv(meta)
+        assert cache[1].view(FN).float()[0].item() == 0.015625
+        fac = types.SimpleNamespace(connector_worker=w)
+        sending, recving = facade.get_finished(fac, set())
+        assert sending is None and recving == {"r9"}
+        # drain-once: the second call sees an empty pendings set
+        sending, recving = facade.get_finished(fac, set())
+        assert sending is None and not recving
+        # connector_worker=None (scheduler role) falls through untouched
+        fac4 = types.SimpleNamespace(connector_worker=None)
+        sending, recving = facade.get_finished(fac4, set())
+        assert sending is None and recving is None
+    finally:
+        facade.get_num_new_matched_tokens = orig_matched
+        facade.get_finished = orig_finished
+        worker_cls.start_fill_kv = orig_start_fill
+
+
 # ------------------------------------------------------------ registration ---
 
 

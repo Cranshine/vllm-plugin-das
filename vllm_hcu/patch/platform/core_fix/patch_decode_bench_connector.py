@@ -111,7 +111,41 @@ _GROUP_MODE_FLOAT = "float"
 _GROUP_MODE_DS_MLA = "packed_ds_mla"
 _GROUP_MODE_MAMBA = "mamba_state"
 
-_LOG = logging.getLogger("vllm_hcu.patch.decode_bench_fp8_fill")
+# 2026-11-16 TTFT fix: the deployed fill profile (11_14 K3.1 32-rank serve,
+# full bench_k31_1114_128k) shows the synchronous-connector fill is the whole
+# bs16 TTFT story: every request hand-builds a block-id host list and
+# materialises a full-height fill-value matrix per (layer, request) --
+# for a 131072-token request that is ~8192 ids/layer x ~76 layers, with the
+# const path writing the payload twice (materialise + index_put). Three
+# plugin-side cuts, all bench-only and semantically identical:
+#   * contiguous block ranges go through torch.arange instead of a python
+#     list round-trip (the scheduler always allocates one contiguous range
+#     per request/group from update_state_after_alloc);
+#   * constant fills broadcast directly: a byte constant and the
+#     ds_mla/mamba one-row patterns are written expanded straight into the
+#     cache instead of materialising a full (num_blocks, ...) value tensor
+#     first;
+#   * the async fill loop (get_num_new_matched_tokens reports is_async =
+#     True, worker start_fill_kv records filled ids, facade get_finished
+#     drains them) is ON whenever the env VLLM_HCU_DECODE_BENCH_ASYNC_FILL
+#     is not explicitly "0"/"false"/"off"/"no"; a serve that needs the
+#     legacy synchronous fill sets it to 0.
+_ASYNC_FILL_ENV = "VLLM_HCU_DECODE_BENCH_ASYNC_FILL"
+_ASYNC_FILLED_ATTR = "_hcu_async_filled_ids"
+
+
+def _async_fill_enabled() -> bool:
+    import os
+
+    return os.environ.get(_ASYNC_FILL_ENV, "").strip().lower() not in (
+        "0",
+        "false",
+        "off",
+        "no",
+    )
+
+
+_LOG = logging.getLogger("vllm.hcu.decode_bench_fp8_fill")  # "vllm." prefix: serve-visible
 
 
 def _iter_layer_specs(kv_cache_spec: Any):
@@ -129,6 +163,38 @@ def _iter_layer_specs(kv_cache_spec: Any):
         except TypeError:
             pass
     return (kv_cache_spec,)
+
+
+def _block_ids_to_device(block_ids, device) -> Any:
+    """Move a block-id list/sequence to a device tensor, cheaply.
+
+    The scheduler hands one contiguous ascending range per request/group
+    (``update_state_after_alloc`` slices ``group_blocks[a:b]``), so when the
+    ids really are dense, ``torch.arange`` skips the python-list round trip
+    (an 8192-element host list per layer per request is a measurable TTFT
+    cost at 128k context). Any other shape falls back to ``torch.tensor``;
+    the returned tensor is validated by the caller as before.
+    """
+    import torch
+
+    if isinstance(block_ids, range):
+        return torch.arange(
+            block_ids.start, block_ids.stop, block_ids.step,
+            device=device, dtype=torch.long,
+        )
+    ids = list(block_ids)
+    if len(ids) > 1 and all(
+        isinstance(v, int) and ids[i + 1] - ids[i] == 1
+        for i, v in enumerate(ids[:-1])
+    ):
+        return torch.arange(
+            ids[0], ids[0] + len(ids), device=device, dtype=torch.long
+        )
+    return torch.tensor(ids, dtype=torch.long, device=device)
+
+
+def _valid_ids(block_ids_tensor: Any, num_blocks: int) -> Any:
+    return block_ids_tensor[block_ids_tensor < num_blocks]
 
 
 def _flavour_mode(flavour: str) -> str | None:
@@ -353,6 +419,119 @@ def _mamba_page_pattern(shapes, dtypes, width, fill_mean, fill_std, device):
     return entry
 
 
+def _arm_async_gate_if_requested(module: ModuleType) -> bool:
+    """Arm the async fill loop (ON by default).
+
+    Async is announced by flipping the facade's get_num_new_matched_tokens
+    to the upstream async contract. That alone is a deadlock: the scheduler
+    parks the request until its id shows up in finished_recving, and the
+    base class's get_finished() statically returns (None, None) -- this
+    connector never reports completion. So the gate only arms as a LOOP:
+
+    * worker ``start_fill_kv`` wrapper records the request ids whose fill
+      payload was submitted this step (the fill itself stays synchronous
+      launches on the step stream, so the data is ordered before the next
+      forward that touches the request);
+    * facade ``get_finished`` drains those ids into finished_recving, which
+      releases the parked request on the next schedule pass.
+
+    A serve that needs the legacy synchronous fill sets
+    VLLM_HCU_DECODE_BENCH_ASYNC_FILL=0.
+
+    Independent of the worker's idempotence marker on purpose: the platform
+    callback can re-fire (worker armed, facade untouched), and the gate
+    must still land; double wrapping is prevented by per-wrapper flags.
+    The env is read at arm time only -- the gate lasts for the process
+    lifetime (a serve cannot flip env mid-flight; in-process tests restore
+    the original methods in finally blocks).
+    Arming runs BEFORE any worker-method installation, so a raise here (a
+    drifted upstream would break the loop) leaves the tree clean.
+    """
+    if not _async_fill_enabled():
+        _LOG.info(
+            "[decode-bench-fp8-fill] async fill disabled via %s=0: keeping "
+            "the legacy synchronous fill",
+            _ASYNC_FILL_ENV,
+        )
+        return False
+    connector_cls = getattr(module, "DecodeBenchConnector", None)
+    worker_cls = getattr(module, "DecodeBenchConnectorWorker", None)
+    if connector_cls is None or worker_cls is None:
+        raise PatchCompatibilityError(
+            "decode_bench async fill requested but the connector facade or "
+            f"worker class is missing in {TARGET_MODULE}"
+        )
+    original_start_fill = getattr(worker_cls, "start_fill_kv", None)
+    if not callable(original_start_fill):
+        raise PatchCompatibilityError(
+            f"{TARGET_MODULE}.DecodeBenchConnectorWorker.start_fill_kv is "
+            "missing; async fill cannot track completion"
+        )
+    if getattr(worker_cls.start_fill_kv, _WRAPPER_FLAG, False) is False:
+        @functools.wraps(original_start_fill)
+        def start_fill_kv_capture(self, metadata, *args, **kwargs):
+            result = original_start_fill(self, metadata, *args, **kwargs)
+            try:
+                pending = getattr(self, _ASYNC_FILLED_ATTR, None)
+                if pending is None:
+                    pending = set()
+                    setattr(self, _ASYNC_FILLED_ATTR, pending)
+                reqs = getattr(metadata, "reqs_to_fill", None) or {}
+                for req_id in getattr(reqs, "keys", lambda: ())():
+                    pending.add(req_id)
+            except Exception:  # pragma: no cover - bookkeeping must not die
+                _LOG.exception(
+                    "[decode-bench-fp8-fill] async fill bookkeeping failed"
+                )
+            return result
+
+        start_fill_kv_capture.__name__ = original_start_fill.__name__
+        start_fill_kv_capture.__qualname__ = original_start_fill.__qualname__
+        setattr(start_fill_kv_capture, _WRAPPER_FLAG, True)
+        worker_cls.start_fill_kv = start_fill_kv_capture
+
+    current = connector_cls.get_num_new_matched_tokens
+    if getattr(current, _WRAPPER_FLAG, False) is False:
+        original_matched = current
+
+        @functools.wraps(original_matched)
+        def matched_async(self, request, num_computed_tokens):
+            num_tokens, _ = original_matched(
+                self, request, num_computed_tokens)
+            return num_tokens, bool(num_tokens)
+
+        matched_async.__name__ = original_matched.__name__
+        matched_async.__qualname__ = original_matched.__qualname__
+        setattr(matched_async, _WRAPPER_FLAG, True)
+        connector_cls.get_num_new_matched_tokens = matched_async
+
+    original_finished = connector_cls.get_finished
+    if getattr(original_finished, _WRAPPER_FLAG, False) is False:
+        @functools.wraps(original_finished)
+        def get_finished_filled(self, finished_req_ids):
+            sending, recving = original_finished(self, finished_req_ids)
+            worker = getattr(self, "connector_worker", None)
+            pending = getattr(worker, _ASYNC_FILLED_ATTR, None)
+            if pending:
+                recving = set(recving or ()) | pending
+                pending.clear()
+            return sending, recving
+
+        get_finished_filled.__name__ = original_finished.__name__
+        get_finished_filled.__qualname__ = original_finished.__qualname__
+        setattr(get_finished_filled, _WRAPPER_FLAG, True)
+        connector_cls.get_finished = get_finished_filled
+
+    _LOG.info(
+        "[decode-bench-fp8-fill] async fill enabled via %s: fills submit "
+        "after the forward launch and completion is reported through "
+        "get_finished; expect per-request fill latency to persist while "
+        "queue stalls disappear",
+        _ASYNC_FILL_ENV,
+    )
+    return True
+
+
 def _apply(module: ModuleType) -> bool:
     import torch
 
@@ -388,6 +567,11 @@ def _apply(module: ModuleType) -> bool:
         f"{_TARGETS_BASE}._fill_state_tensor",
         ["self", "kv_cache", "fill_mean", "fill_std"],
     )
+
+    # Opt-in async gate arms FIRST: on an explicitly requested env whose
+    # upstream shapes drifted, we want the raise to leave the worker
+    # completely un-armed (fail clean, arm order = reverse of teardown).
+    _arm_async_gate_if_requested(module)
 
     if getattr(worker_cls, _PATCHED_FLAG, False):
         return False  # already armed in a previous callback run
@@ -522,14 +706,13 @@ def _apply(module: ModuleType) -> bool:
                     exc,
                 )
                 return original_fill_block(self, kv_cache, block_ids, fill_mean, fill_std)
-            block_ids_tensor = torch.tensor(
-                block_ids, dtype=torch.long, device=kv_cache.device
-            )
-            valid_block_ids = block_ids_tensor[
-                block_ids_tensor < kv_cache.shape[0]
-            ]
+            ids = _block_ids_to_device(block_ids, kv_cache.device)
+            valid_block_ids = _valid_ids(ids, kv_cache.shape[0])
             if len(valid_block_ids) == 0:
                 return None
+            # One-page pattern row broadcast over the selected rows: the 1-D
+            # pattern also lands correctly on (num_blocks, bs, width) state
+            # pages; no full-height matrix is ever materialised.
             kv_cache[valid_block_ids] = _encode_like(entry, kv_cache.dtype)
             return None
         if kv_cache.shape[-1] == _DS_MLA_WIDTH and mode in (
@@ -541,14 +724,14 @@ def _apply(module: ModuleType) -> bool:
             # group); fill it with the block-scaled pattern. Non-656 byte
             # tensors in a mixed group are scalar-FP8 storage, handled below.
             entry = _ds_mla_pattern(fill_mean, fill_std, kv_cache.device)
-            block_ids_tensor = torch.tensor(
-                block_ids, dtype=torch.long, device=kv_cache.device
-            )
-            valid_block_ids = block_ids_tensor[
-                block_ids_tensor < kv_cache.shape[0]
-            ]
+            ids = _block_ids_to_device(block_ids, kv_cache.device)
+            valid_block_ids = _valid_ids(ids, kv_cache.shape[0])
             if len(valid_block_ids) == 0:
                 return None
+            # One 656-byte pattern row broadcast over the selected blocks.
+            # Keep it 1-D: a 656-wide cache may be (num_blocks, 656) or
+            # (num_blocks, block_size, 656), and the 1-D row broadcasts to
+            # both, matching the historical full-matrix write bit-exactly.
             kv_cache[valid_block_ids] = _encode_like(entry, kv_cache.dtype)
             return None
         if mode != _GROUP_MODE_PLAIN:
@@ -569,26 +752,30 @@ def _apply(module: ModuleType) -> bool:
             # MIXED byte tensors that are not 656-byte ds_mla entries are
             # scalar-FP8 storage: encode the fill exactly like PLAIN.
 
-        block_ids_tensor = torch.tensor(
-            block_ids, dtype=torch.long, device=kv_cache.device
-        )
-        valid_mask = block_ids_tensor < kv_cache.shape[0]
-        valid_block_ids = block_ids_tensor[valid_mask]
+        ids = _block_ids_to_device(block_ids, kv_cache.device)
+        valid_block_ids = _valid_ids(ids, kv_cache.shape[0])
         if len(valid_block_ids) == 0:
             return None
-        target_shape = (len(valid_block_ids),) + tuple(kv_cache.shape[1:])
         if fill_std > 0:
+            # Random fill keeps the full-height materialisation (values are
+            # all distinct anyway); the win here is only the cheap id path.
             fill_bytes = _encode_random(
-                fill_mean, fill_std, target_shape, kv_cache.device
+                fill_mean, fill_std,
+                (len(valid_block_ids),) + tuple(kv_cache.shape[1:]),
+                kv_cache.device,
             )
-        else:
-            fill_bytes = torch.full(
-                target_shape,
-                _encode_scalar(fill_mean),
-                dtype=torch.uint8,
-                device=kv_cache.device,
-            )
-        kv_cache[valid_block_ids] = _encode_like(fill_bytes, kv_cache.dtype)
+            kv_cache[valid_block_ids] = _encode_like(fill_bytes, kv_cache.dtype)
+            return None
+        # Constant fill: one encoded byte broadcast straight into the rows.
+        # The old path materialised (num_blocks,)+(block shape) bytes on the
+        # device and then copied them into the cache -- double traffic on a
+        # path that only ever writes one repeated value. int8 storages take
+        # the signed twin of the encoded byte so the bit pattern matches the
+        # view(torch.int8) semantics of the previous _encode_like path.
+        byte = _encode_scalar(fill_mean)
+        if kv_cache.dtype == torch.int8 and byte > 127:
+            byte -= 256
+        kv_cache[valid_block_ids] = byte
         return None
 
     @functools.wraps(original_fill_state)
@@ -625,8 +812,10 @@ def _apply(module: ModuleType) -> bool:
         "MLA+KDA) fill per layer: float storage via upstream, byte storage "
         "via the encodings above; packed/unknown layouts fall back to the "
         "upstream fill with a warning (packed bytes read as zeros); float, "
-        "state and zero-fill paths keep upstream semantics. Nothing on this "
-        "bench-only fill path aborts the serve."
+        "state and zero-fill paths keep upstream semantics. Constant fills "
+        "broadcast one encoded byte straight into the selected rows and "
+        "contiguous block ranges skip the python-list round trip. Nothing "
+        "on this bench-only fill path aborts the serve."
     )
     return True
 
@@ -635,7 +824,7 @@ def apply_to_module(module: ModuleType) -> bool:
     try:
         return _apply(module)
     except Exception:
-        _log = logging.getLogger("vllm_hcu.patch.decode_bench_fp8_fill")
+        _log = logging.getLogger("vllm.hcu.decode_bench_fp8_fill")
         _log.exception("[decode-bench-fp8-fill] failed to arm (fail closed)")
         raise
 
